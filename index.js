@@ -31,14 +31,32 @@ const token = process.env.BOT_TOKEN;
 const ownerId = process.env.OWNER_ID;
 const ownerChatId = process.env.OWNER_CHAT_ID;
 
-// Buat instance bot
+// Buat instance bot dengan error handling
 const bot = new TelegramBot(token, {
-  polling: true,
+  polling: {
+    autoStart: true,
+    params: {
+      timeout: 10
+    }
+  },
   filepath: false,
-  // Fix deprecation warning for file content-type
   baseApiUrl: 'https://api.telegram.org',
   request: {
     url: 'https://api.telegram.org'
+  }
+});
+
+// Handle polling errors
+bot.on('polling_error', (error) => {
+  console.error(`Polling error: ${error.code}`, error.message);
+  if (error.code === 'ETELEGRAM' && error.message.includes('terminated by other getUpdates')) {
+    console.log('Detected conflicting bot instance, waiting before reconnecting...');
+    setTimeout(() => {
+      console.log('Attempting to restart polling...');
+      bot.stopPolling().then(() => {
+        return bot.startPolling();
+      }).catch(console.error);
+    }, 5000);
   }
 });
 
@@ -47,6 +65,16 @@ const userManager = new UserManager();
 
 // Fungsi untuk cek apakah pengirim adalah owner
 const isOwner = (msg) => msg.from.id.toString() === ownerId;
+
+// Helper function to escape special characters for MarkdownV2
+const escapeMarkdown = (text) => {
+  return text.toString().replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+};
+
+// Helper function to format size to MB
+const formatSizeMB = (bytes) => {
+  return (bytes / (1024 * 1024)).toFixed(1);
+};
 
 // Command /getid - dapat diakses semua orang
 bot.onText(/\/getid/, (msg) => {
@@ -1143,6 +1171,67 @@ async function processConversion(chatId, txtFileName, userFolder) {
   }
 }
 
+// Command /checklimit - cek batasan storage user
+bot.onText(/\/checklimit(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+
+  // Cek apakah pengirim adalah owner
+  if (!isOwner(msg)) {
+    await bot.sendMessage(chatId, '⛔ Maaf, command ini hanya untuk owner\\.', {
+      parse_mode: 'MarkdownV2'
+    });
+    return;
+  }
+
+  const targetId = match[1];
+
+  if (!targetId) {
+    await bot.sendMessage(chatId, 'ℹ️ Format: `/checklimit <chat_id>`', {
+      parse_mode: 'MarkdownV2'
+    });
+    return;
+  }
+
+  try {
+    // Pastikan user target terdaftar
+    if (!userManager.hasUser(targetId)) {
+      await bot.sendMessage(chatId, `⚠️ User dengan ID ${escapeMarkdown(targetId)} tidak terdaftar\\.`, {
+        parse_mode: 'MarkdownV2'
+      });
+      return;
+    }
+
+    // Ambil info batasan storage
+    const limits = userManager.getStorageLimits(targetId);
+
+    // Ambil info penggunaan storage
+    const userFolder = path.join(__dirname, 'userfiles', targetId);
+    const storage = await getUserStorageInfo(userFolder);
+
+    // Format pesan
+    const message = [
+      '*Info Batasan Storage User*\\n',
+      `User ID: \`${escapeMarkdown(targetId)}\`\\n`,
+      '*Batasan:*',
+      `• Files: ${escapeMarkdown(limits.MAX_FILES_PER_USER.toString())} file`,
+      `• Size/file: ${escapeMarkdown(formatSizeMB(limits.MAX_FILE_SIZE))} MB`,
+      `• Total size: ${escapeMarkdown(formatSizeMB(limits.MAX_TOTAL_SIZE))} MB\\n`,
+      '*Penggunaan:*',
+      `• Files: ${escapeMarkdown(storage.fileCount.toString())}/${escapeMarkdown(limits.MAX_FILES_PER_USER.toString())}`,
+      `• Total size: ${escapeMarkdown(formatBytes(storage.totalSize))}/${escapeMarkdown(formatBytes(limits.MAX_TOTAL_SIZE))}`,
+      `• Persentase: ${escapeMarkdown(Math.round((storage.totalSize / limits.MAX_TOTAL_SIZE) * 100).toString())}%`
+    ].join('\n');
+
+    await bot.sendMessage(chatId, message, {
+      parse_mode: 'MarkdownV2'
+    });
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`, {
+      parse_mode: 'MarkdownV2'
+    });
+  }
+});
+
 // Command /clean - membersihkan storage
 bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -1281,29 +1370,29 @@ bot.onText(/\/help/, async (msg) => {
   const chatId = msg.chat.id;
 
   const helpMessage = 
-`\\*Panduan Penggunaan Bot\\*
+`*Panduan Penggunaan Bot*
 
-1️⃣ \\*Persiapan File TXT\\*
+1️⃣ *Persiapan File TXT*
 • Buat file txt berisi daftar nomor
 • Format: 0812xxx, 628xxx, +62812xxx
 • Satu nomor per baris
 • Minimal 10 digit
 
-2️⃣ \\*Langkah Konversi\\*
+2️⃣ *Langkah Konversi*
 1. Kirim file txt ke bot
 2. Ketik: /txt2vcf [nama_file]
 3. Ikuti instruksi bot
 4. Download file VCF
 5. Import ke smartphone
 
-3️⃣ \\*Perintah Penting\\*
+3️⃣ *Perintah Penting*
 • /myfiles - lihat daftar file
 • /getfile [nama] - ambil file
 • /deletefile [nama] - hapus file
 • /clean - bersihkan storage
 • /storage - cek penggunaan storage
 
-4️⃣ \\*Format Nomor Valid\\*
+4️⃣ *Format Nomor Valid*
 ✅ Benar:
 0812xxxxxxxx
 628xxxxxxxxx
@@ -1314,7 +1403,7 @@ bot.onText(/\/help/, async (msg) => {
 62812xxxxx (kurang digit)
 +62 812 xxxx (ada spasi)
 
-5️⃣ \\*Tips\\*
+5️⃣ *Tips*
 • Cek format nomor sebelum konversi
 • Backup file penting
 • Hapus file tidak terpakai
@@ -1330,88 +1419,125 @@ Contoh: /txt2vcf contacts`;
 });
 
 // Command /setlimit - atur batasan storage user
-bot.onText(/\/setlimit(?:\\s+(\\d+))?\\s*(?:\\s+(\\d+))?\\s*(?:\\s+(\\d+))?\\s*(?:\\s+(\\d+))?/, async (msg, match) => {
+bot.onText(/\/setlimit(?:\s+(\d+))(?:\s+(-|reset|\d+))?(?:\s+(-|\d+))?(?:\s+(-|\d+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
 
   // Cek apakah pengirim adalah owner
   if (!isOwner(msg)) {
-    bot.sendMessage(chatId, '⛔ Maaf, hanya owner yang bisa menggunakan command ini.');
+    await bot.sendMessage(chatId, '⛔ Maaf, hanya owner yang bisa menggunakan command ini\\.', {
+      parse_mode: 'MarkdownV2'
+    });
     return;
   }
 
   // Parse parameters
-  const targetId = match[1];
-  const files = match[2] ? parseInt(match[2]) : null;
-  const fileSize = match[3] ? parseInt(match[3]) : null;
-  const totalSize = match[4] ? parseInt(match[4]) : null;
-
-  // Jika tidak ada parameter atau hanya chat_id, tampilkan bantuan
-  if (!targetId || (!files && !fileSize && !totalSize)) {
+  const [, targetId, filesStr, fileSizeStr, totalSizeStr] = match;
+  
+  // Jika hanya chat_id, tampilkan bantuan
+  if (!filesStr && !fileSizeStr && !totalSizeStr) {
     const helpMessage = 
-`\\*Pengaturan Batasan Storage\\*
+      '*Pengaturan Batasan Storage*\n\n' +
+      'Format: `/setlimit <chat\\_id> <files> <size\\_mb> <total\\_mb>`\n\n' +
+      'Contoh:\n' +
+      '• `/setlimit 123456789 50 5 100`\n' +
+      '  Set limit: 50 file, 5MB/file, total 100MB\n' +
+      '• `/setlimit 123456789 20 - -`\n' +
+      '  Set jumlah file saja: 20 file\n' +
+      '• `/setlimit 123456789 - 10 -`\n' +
+      '  Set ukuran file saja: 10MB/file\n' +
+      '• `/setlimit 123456789 reset`\n' +
+      '  Reset ke default\n\n' +
+      'Parameter:\n' +
+      '• chat\\_id: ID user yang akan diatur\n' +
+      '• files: Jumlah maksimal file \\(\\- = tidak diubah\\)\n' +
+      '• size\\_mb: Ukuran maksimal per file \\(\\- = tidak diubah\\)\n' +
+      '• total\\_mb: Total ukuran maksimal \\(\\- = tidak diubah\\)';
 
-Format: \`/setlimit <chat_id> <files> <size_mb> <total_mb>\`
-
-Contoh:
-• \`/setlimit 123456789 50 5 100\`
-  Set limit: 50 file, 5MB/file, total 100MB
-
-• \`/setlimit 123456789 30\`
-  Ubah limit jadi 30 file, size tetap
-
-• \`/setlimit 123456789\`
-  Cek limit user saat ini
-
-Parameter:
-• chat_id: ID user (wajib)
-• files: Jumlah maksimal file
-• size_mb: Ukuran max per file (MB)
-• total_mb: Total storage (MB)
-
-Gunakan \`/resetlimit\` untuk reset ke default`;
-
-    bot.sendMessage(chatId, helpMessage, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(chatId, helpMessage, {
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: true
+    });
     return;
   }
 
-  // Jika hanya ada chat_id, tampilkan info limit user tersebut
-  if (!files && !fileSize && !totalSize) {
-    const info = userManager.getUserStorageInfo(targetId);
-    const message = 
-`📊 \\*Storage Limit untuk User ${targetId}\\*
-
-• Maksimal File: \`${info.maxFiles}\` file
-• Ukuran per File: \`${info.maxFileSize}\` MB
-• Total Storage: \`${info.maxTotalSize}\` MB
-
-Gunakan \`/setlimit\` untuk mengubah limit`;
-
-    bot.sendMessage(chatId, message, { parse_mode: 'MarkdownV2' });
-    return;
-  }
-
-  // Set limit baru
   try {
-    userManager.setStorageLimits(targetId, {
-      files: files,
-      fileSize: fileSize,
-      totalSize: totalSize
+    // Pastikan user target terdaftar
+    if (!userManager.hasUser(targetId)) {
+      await bot.sendMessage(chatId, `⚠️ User dengan ID ${escapeMarkdown(targetId)} tidak terdaftar\\.`, {
+        parse_mode: 'MarkdownV2'
+      });
+      return;
+    }
+
+    // Handle reset command
+    if (filesStr === 'reset') {
+      userManager.resetStorageLimits(targetId);
+      const newLimits = userManager.getStorageLimits(targetId);
+      const confirmMessage = [
+        '✅ *Berhasil reset batasan storage ke default*\n',
+        `User ID: \`${escapeMarkdown(targetId)}\``,
+        'Limit default:',
+        `• Files: ${escapeMarkdown(newLimits.MAX_FILES_PER_USER)} file`,
+        `• Size/file: ${escapeMarkdown(formatSizeMB(newLimits.MAX_FILE_SIZE))} MB`,
+        `• Total size: ${escapeMarkdown(formatSizeMB(newLimits.MAX_TOTAL_SIZE))} MB`
+      ].join('\n');
+
+      await bot.sendMessage(chatId, confirmMessage, {
+        parse_mode: 'MarkdownV2'
+      });
+      return;
+    }
+
+    // Get current limits for reference
+    const currentLimits = userManager.getStorageLimits(targetId);
+
+    // Parse parameters, keeping current values if '-' is specified
+    const files = filesStr === '-' ? null : parseInt(filesStr);
+    const fileSize = fileSizeStr === '-' ? null : parseInt(fileSizeStr);
+    const totalSize = totalSizeStr === '-' ? null : parseInt(totalSizeStr);
+
+    // Validasi nilai parameter
+    if (files !== null) {
+      if (files <= 0) throw new Error('Jumlah file harus lebih dari 0');
+    }
+    if (fileSize !== null) {
+      if (fileSize <= 0) throw new Error('Ukuran file harus lebih dari 0 MB');
+    }
+    if (totalSize !== null) {
+      if (totalSize <= 0) throw new Error('Total ukuran harus lebih dari 0 MB');
+    }
+
+    // Check file size vs total size
+    const effectiveFileSize = fileSize || Math.floor(currentLimits.MAX_FILE_SIZE / (1024 * 1024));
+    const effectiveTotalSize = totalSize || Math.floor(currentLimits.MAX_TOTAL_SIZE / (1024 * 1024));
+    if (effectiveFileSize > effectiveTotalSize) {
+      throw new Error('Ukuran per file tidak boleh lebih besar dari total ukuran');
+    }
+
+    // Set limit storage untuk user
+    const newLimits = await userManager.setStorageLimits(targetId, {
+      files,
+      fileSize,
+      totalSize
     });
 
-    const info = userManager.getUserStorageInfo(targetId);
-    const message = 
-`✅ \\*Berhasil mengatur limit storage\\*
+    // Format pesan konfirmasi
+    const confirmMessage = [
+      '✅ *Berhasil mengatur batasan storage*\n',
+      `User ID: \`${escapeMarkdown(targetId)}\``,
+      'Limit baru:',
+      `• Files: ${escapeMarkdown(newLimits.maxFiles)} file`,
+      `• Size/file: ${escapeMarkdown(formatSizeMB(newLimits.maxFileSize))} MB`,
+      `• Total size: ${escapeMarkdown(formatSizeMB(newLimits.maxTotalSize))} MB`
+    ].join('\n');
 
-📊 \\*Limit Baru:\\*
-• Chat ID: \`${targetId}\`
-• Maksimal File: \`${info.maxFiles}\` file
-• Ukuran per File: \`${info.maxFileSize}\` MB
-• Total Storage: \`${info.maxTotalSize}\` MB`;
-
-    bot.sendMessage(chatId, message, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(chatId, confirmMessage, {
+      parse_mode: 'MarkdownV2'
+    });
   } catch (error) {
-    console.error('Error setting limits:', error);
-    bot.sendMessage(chatId, '❌ Gagal mengatur limit: ' + error.message);
+    await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`, {
+      parse_mode: 'MarkdownV2'
+    });
   }
 });
 
@@ -1421,32 +1547,77 @@ bot.onText(/\/resetlimit(?:\s+(\d+))?/, async (msg, match) => {
 
   // Cek apakah pengirim adalah owner
   if (!isOwner(msg)) {
-    bot.sendMessage(chatId, '⛔ Maaf, hanya owner yang bisa menggunakan command ini.');
+    await bot.sendMessage(chatId, '⛔ Maaf, hanya owner yang bisa menggunakan command ini.');
     return;
   }
 
   const targetId = match[1];
 
   if (!targetId) {
-    bot.sendMessage(chatId, 'ℹ️ Format: \`/resetlimit <chat_id>\`', { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(chatId, 'ℹ️ Format: `/resetlimit <chat_id>`', {
+      parse_mode: 'MarkdownV2'
+    });
     return;
   }
 
   try {
-    userManager.resetStorageLimits(targetId);
+    await userManager.resetStorageLimits(targetId);
     const info = userManager.getUserStorageInfo(targetId);
     const message = 
-`✅ \\*Berhasil reset limit storage\\*
+      '✅ *Berhasil reset limit storage*\n\n' +
+      `User ID: \`${targetId}\`\n` +
+      'Limit default:\n' +
+      `• Files: ${info.maxFiles} file\n` +
+      `• Size/file: ${info.maxFileSize} MB\n` +
+      `• Total size: ${info.maxTotalSize} MB`;
 
-📊 \\*Limit Default:\\*
-• Chat ID: \`${targetId}\`
-• Maksimal File: \`${info.maxFiles}\` file
-• Ukuran per File: \`${info.maxFileSize}\` MB
-• Total Storage: \`${info.maxTotalSize}\` MB`;
-
-    bot.sendMessage(chatId, message, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(chatId, message, {
+      parse_mode: 'MarkdownV2'
+    });
   } catch (error) {
-    console.error('Error resetting limits:', error);
-    bot.sendMessage(chatId, '❌ Gagal reset limit: ' + error.message);
+    await bot.sendMessage(chatId, `❌ Error: ${error.message}`, {
+      parse_mode: 'MarkdownV2'
+    });
+  }
+});
+
+// Command /getlimits - tampilkan batasan storage semua user
+bot.onText(/\/getlimits/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  // Cek apakah pengirim adalah owner
+  if (!isOwner(msg)) {
+    await bot.sendMessage(chatId, '⛔ Maaf, hanya owner yang bisa menggunakan command ini\\.', {
+      parse_mode: 'MarkdownV2'
+    });
+    return;
+  }
+
+  try {
+    const users = userManager.getUsers();
+    if (users.length === 0) {
+      await bot.sendMessage(chatId, '❕ Belum ada user yang terdaftar\\.', {
+        parse_mode: 'MarkdownV2'
+      });
+      return;
+    }
+
+    let message = '*Daftar Batasan Storage User*\n\n';
+    
+    for (const userId of users) {
+      const limits = userManager.getStorageLimits(userId);
+      message += `👤 User ID: \`${escapeMarkdown(userId)}\`\n`;
+      message += `• Files: ${escapeMarkdown(limits.MAX_FILES_PER_USER)} file\n`;
+      message += `• Size/file: ${escapeMarkdown(formatSizeMB(limits.MAX_FILE_SIZE))} MB\n`;
+      message += `• Total size: ${escapeMarkdown(formatSizeMB(limits.MAX_TOTAL_SIZE))} MB\n\n`;
+    }
+
+    await bot.sendMessage(chatId, message, {
+      parse_mode: 'MarkdownV2'
+    });
+  } catch (error) {
+    await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`, {
+      parse_mode: 'MarkdownV2'
+    });
   }
 });

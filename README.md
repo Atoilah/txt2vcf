@@ -173,6 +173,30 @@ Bot Telegram untuk mengkonversi daftar nomor telepon dari file TXT menjadi file 
 - Minimal digit nomor: 10
 - Maksimal split file: 10
 
+## 🔧 Error Handling & Reliability
+1. **Polling Error Recovery**
+   - Automatic detection of conflicting bot instances
+   - Smart reconnection with 5-second cooldown
+   - Graceful error handling for Telegram API issues
+
+2. **Bot Instance Management**
+   - Single instance enforcement
+   - Proper shutdown handling
+   - Automatic recovery from network issues
+
+### 🛠️ Technical Details
+1. **Bot Configuration**
+   - Polling timeout: 10 seconds
+   - Auto-start enabled
+   - Filepath caching disabled
+   - Custom API URL configuration
+
+2. **Error Types Handled**
+   - ETELEGRAM conflicts
+   - Network connectivity issues
+   - API rate limiting
+   - Timeout errors
+
 ## 💡 Catatan
 - Pastikan format nomor telepon sesuai
 - Backup file penting secara berkala

@@ -36,13 +36,40 @@ class UserManager {
   }
 
   setStorageLimits(chatId, limits) {
+    if (!limits || typeof limits !== 'object') {
+      throw new Error('Invalid limits object');
+    }
+
+    // Validate input values
+    const files = parseInt(limits.files);
+    const fileSize = parseInt(limits.fileSize);
+    const totalSize = parseInt(limits.totalSize);
+
+    if (files && (isNaN(files) || files < 1)) {
+      throw new Error('Files limit must be a positive number');
+    }
+    if (fileSize && (isNaN(fileSize) || fileSize < 1)) {
+      throw new Error('File size limit must be a positive number');
+    }
+    if (totalSize && (isNaN(totalSize) || totalSize < 1)) {
+      throw new Error('Total size limit must be a positive number');
+    }
+
     const currentLimits = this.getStorageLimits(chatId);
-    this.userLimits.set(chatId.toString(), {
-      MAX_FILES_PER_USER: limits.files || currentLimits.MAX_FILES_PER_USER,
-      MAX_FILE_SIZE: (limits.fileSize || currentLimits.MAX_FILE_SIZE) * 1024 * 1024, // Convert MB to bytes
-      MAX_TOTAL_SIZE: (limits.totalSize || currentLimits.MAX_TOTAL_SIZE) * 1024 * 1024 // Convert MB to bytes
-    });
+    const newLimits = {
+      MAX_FILES_PER_USER: files || currentLimits.MAX_FILES_PER_USER,
+      MAX_FILE_SIZE: (fileSize || Math.floor(currentLimits.MAX_FILE_SIZE / (1024 * 1024))) * 1024 * 1024,
+      MAX_TOTAL_SIZE: (totalSize || Math.floor(currentLimits.MAX_TOTAL_SIZE / (1024 * 1024))) * 1024 * 1024
+    };
+
+    // Ensure total size is not less than max file size
+    if (newLimits.MAX_TOTAL_SIZE < newLimits.MAX_FILE_SIZE) {
+      throw new Error('Total size limit cannot be less than file size limit');
+    }
+
+    this.userLimits.set(chatId.toString(), newLimits);
     this.saveUserLimits();
+    return this.getUserStorageInfo(chatId);
   }
 
   resetStorageLimits(chatId) {
