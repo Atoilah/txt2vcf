@@ -1,5 +1,22 @@
-# Object file
-*.o
+# Dependencies
+node_modules/
 
-# Ada Library Information
-*.ali
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Runtime data
+userfiles/
+users.txt
+user_limits.json
+active_users.txt
+
+# IDE
+.vscode/
+.idea/
