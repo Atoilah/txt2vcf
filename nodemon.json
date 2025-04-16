@@ -1,0 +1,12 @@
+{
+  "watch": [
+    "index.js",
+    "users.js",
+    ".env"
+  ],
+  "ignore": [
+    "users.txt",
+    "node_modules/**/node_modules"
+  ],
+  "ext": "js,json,env"
+}
