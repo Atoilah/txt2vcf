@@ -890,7 +890,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
       `ℹ️ Total kontak: ${totalContacts}\n` +
       (recommendedSplit > 0 ? `💡 Rekomendasi: ${recommendedSplit} file\n` : '') +
       '\nKetik 0 untuk tidak memecah (semua kontak dalam 1 file)\n' +
-      'Ketik 2-10 untuk membagi kontak ke beberapa file', {
+      'Ketik angka untuk jumlah kontak setiap file', {
       reply_markup: {
         force_reply: true,
         selective: true
@@ -984,7 +984,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
           });
         }
         await sendFile(chatId, outputPaths[i],
-          `${suffix}\n ℹ️ Berisi ${contactsInFile} kontak\n\n`
+          `ℹ️ Berisi ${contactsInFile} kontak ${suffix}\n`
         );
       } catch (error) {
         console.error(`Error sending file ${i + 1}:`, error);
