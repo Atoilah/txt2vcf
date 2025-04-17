@@ -984,9 +984,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
           });
         }
         await sendFile(chatId, outputPaths[i],
-          `📱 File VCF Anda siap diimpor ke smartphone!${suffix}\n` +
-          `ℹ️ Berisi ${contactsInFile} kontak\n\n` +
-          `💡 Tips: Gunakan aplikasi kontak bawaan untuk impor`);
+          `ℹ️ Berisi ${contactsInFile} kontak\n\n`);
       } catch (error) {
         console.error(`Error sending file ${i + 1}:`, error);
         bot.sendMessage(chatId, `❌ Gagal mengirim file ${i + 1}: ${error.message}`);
