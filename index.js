@@ -983,9 +983,10 @@ async function processConversion(chatId, txtFileName, userFolder) {
             }
           });
         }
-        await sendFile(chatId, outputPaths[i],
-          `ℹ️ Berisi ${contactsInFile} kontak ${suffix}\n`
-        );
+        await sendFile(chatId, outputPaths[i],);
+        // await sendFile(chatId, outputPaths[i],
+        //   `ℹ️ Berisi ${contactsInFile} kontak ${suffix}\n`
+        // );
       } catch (error) {
         console.error(`Error sending file ${i + 1}:`, error);
         bot.sendMessage(chatId, `❌ Gagal mengirim file ${i + 1}: ${error.message}`);
