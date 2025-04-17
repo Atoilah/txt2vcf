@@ -27,7 +27,7 @@ END:VCARD
   cleanPhoneNumber(number) {
     // Hapus semua karakter non-digit
     let cleaned = number.replace(/\D/g, '');
-    
+
     // Jika nomor dimulai dengan 0, coba deteksi negara dari input asli
     if (cleaned.startsWith('0')) {
       // Cek apakah ada kode negara di input asli (e.g. +44, +1, dll)
@@ -39,20 +39,20 @@ END:VCARD
         cleaned = '62' + cleaned.substring(1);
       }
     }
-    
+
     // Deteksi kode negara yang ada
     const countryCode = this.detectCountryCode(cleaned);
-    
+
     // Jika tidak ada kode negara valid, tambahkan 62 (Indonesia)
     if (!countryCode) {
       cleaned = '62' + cleaned;
     }
-    
+
     // Validasi panjang nomor (min 10 digit termasuk kode negara)
     if (cleaned.length < 10) {
       throw new Error(`Nomor terlalu pendek: ${number}`);
     }
-    
+
     return cleaned;
   }
 
@@ -76,12 +76,12 @@ END:VCARD
     let count = 0;
     let fileCount = 0;
     const countries = {};
-    const contactsPerFile = splitCount > 0 ? Math.ceil(lines.length / splitCount) : lines.length;
+    let current = 0;
 
     // Proses setiap baris
     for (const line of lines) {
       const cleanNumber = this.cleanPhoneNumber(line);
-      
+
       if (!cleanNumber) continue;
 
       // Deteksi negara
@@ -104,12 +104,14 @@ END:VCARD
       currentVcf += vcard + '\n\n';
       count++;
 
-      // Jika sudah mencapai batas per file, simpan dan reset
-      if (splitCount > 0 && count % contactsPerFile === 0) {
+      if (splitCount > 0 && current + 1 >= splitCount) {
         vcfContents.push(currentVcf);
         currentVcf = '';
         fileCount++;
+        current = 0;
+        continue;
       }
+      current++
     }
 
     // Simpan sisa kontak jika ada

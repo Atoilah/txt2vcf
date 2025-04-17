@@ -98,12 +98,12 @@ bot.onText(/\/getid/, (msg) => {
 // Command /start - hanya untuk user terdaftar
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  
+
   if (!userManager.hasUser(chatId) && !isOwner(msg)) {
     bot.sendMessage(chatId, '⛔ Maaf, Anda tidak memiliki akses ke bot ini.\nHubungi owner untuk mendapatkan akses.');
     return;
   }
-  
+
   let message = 'Halo! Selamat datang di bot. 👋\n';
   message += `\nℹ️ Status: ${isOwner(msg) ? 'Owner' : 'User Terdaftar'}`;
   message += `\nℹ️ Total pengguna: ${userManager.getUserCount()}`;
@@ -188,7 +188,7 @@ bot.onText(/\/stats/, async (msg) => {
       }
     }
   };
-  
+
   const message = `📊 Statistik Bot:\n\n` +
     `👥 Total Pengguna: ${stats.totalUsers}\n` +
     `⏱ Uptime: ${Math.floor(stats.uptime / 3600)}h ${Math.floor((stats.uptime % 3600) / 60)}m ${stats.uptime % 60}s\n\n` +
@@ -207,7 +207,7 @@ bot.onText(/\/stats/, async (msg) => {
     `🤖 Memory Bot:\n` +
     `• Terpakai: ${stats.system.bot.memory}\n` +
     `• Dialokasikan: ${stats.system.bot.memoryTotal}`;
-  
+
   bot.sendMessage(msg.chat.id, message);
 });
 
@@ -217,7 +217,7 @@ bot.onText(/\/restart/, async (msg) => {
     bot.sendMessage(msg.chat.id, '⛔ Maaf, command ini hanya untuk owner!');
     return;
   }
-  
+
   try {
     await bot.sendMessage(msg.chat.id, '🔄 Memulai proses restart bot...');
     console.log('Restarting bot by owner command...');
@@ -350,7 +350,7 @@ bot.onText(/\/storage/, async (msg) => {
 // Command /createtxt - membuat file txt
 bot.onText(/\/createtxt ([\w-]+) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  
+
   // Cek akses user
   if (!userManager.hasUser(chatId) && !isOwner(msg)) {
     bot.sendMessage(chatId, '⛔ Maaf, Anda tidak memiliki akses ke bot ini.');
@@ -498,188 +498,20 @@ bot.onText(/\/getfile (.+)/, async (msg, match) => {
         else resolve();
       });
     });
-    
-    // Baca file dan validasi nomor
-    const content = await fsPromises.readFile(inputPath, 'utf8');
-    const validation = vcfConverter.validatePhoneNumbers(content);
 
-    if (!validation.valid) {
-      const invalidList = validation.invalidNumbers
-        .map((item, i) => `${i + 1}. ${item.original} - ${item.error}`)
-        .join('\n');
 
-      bot.sendMessage(chatId, 
-        `⚠️ Ditemukan ${validation.invalidNumbers.length} nomor tidak valid:\n\n${invalidList}\n\n` +
-        'Format yang didukung:\n' +
-        '1. Format lokal: 08xx, 628xx\n' +
-        '2. Format internasional: +1xxx (US), +44xxx (UK), dll\n' +
-        '3. Minimal 10 digit (termasuk kode negara)');
-      return;
-    }
-
-    // Tanya nama kontak dan nomor urut awal
-    const askName = await bot.sendMessage(chatId,
-      '📝 Masukkan nama untuk kontak ini:\n' +
-      'Contoh: Teman SMA, Rekan Kerja, dll', {
-      reply_markup: {
-        force_reply: true,
-        selective: true
+    bot.sendDocument(chatId, fs.createReadStream(inputPath), {
+      filename: path.basename(inputPath),
+      contentType: path.extname(inputPath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain',
+      caption: '',
+      fileOptions: {
+        contentType: 'application/octet-stream'
       }
     });
-
-    const nameResponse = await new Promise(resolve => {
-      bot.onReplyToMessage(chatId, askName.message_id, async (nameMsg) => {
-        resolve(nameMsg.text);
-      });
-    });
-
-    const askStartNumber = await bot.sendMessage(chatId,
-      '🔢 Masukkan nomor urut awal:\n' +
-      'Contoh: 1 (untuk mulai dari 1)', {
-      reply_markup: {
-        force_reply: true,
-        selective: true
-      }
-    });
-
-    const startNumberResponse = await new Promise(resolve => {
-      bot.onReplyToMessage(chatId, askStartNumber.message_id, async (numMsg) => {
-        const num = parseInt(numMsg.text);
-        resolve(isNaN(num) ? 1 : num);
-      });
-    });
-
-    // Tanya jumlah file yang diinginkan
-    const askSplitCount = await bot.sendMessage(chatId,
-      '📂 Ingin memecah kontak menjadi berapa file?\n' +
-      'Ketik 0 untuk tidak memecah (semua kontak dalam 1 file)\n' +
-      'Ketik 2-10 untuk membagi kontak ke beberapa file', {
-      reply_markup: {
-        force_reply: true,
-        selective: true
-      }
-    });
-
-    const splitCountResponse = await new Promise(resolve => {
-      bot.onReplyToMessage(chatId, askSplitCount.message_id, async (splitMsg) => {
-        const num = parseInt(splitMsg.text);
-        resolve(isNaN(num) || num < 0 || num > 10 ? 0 : num);
-      });
-    });
-
-    // Tanya nama file VCF
-    const askVcfName = await bot.sendMessage(chatId,
-      '💾 Masukkan nama file VCF:\n' +
-      'Contoh: kontak_wa, daftar_teman, dll', {
-      reply_markup: {
-        force_reply: true,
-        selective: true
-      }
-    });
-
-    const vcfFileName = await new Promise(resolve => {
-      bot.onReplyToMessage(chatId, askVcfName.message_id, async (vcfMsg) => {
-        resolve(sanitize(vcfMsg.text));
-      });
-    });
-
-    // Konversi ke vcf dengan nama dan nomor urut yang diberikan
-    const result = await vcfConverter.convertTxtToVcf(inputPath, {
-      name: nameResponse,
-      startNumber: startNumberResponse,
-      splitCount: splitCountResponse
-    });
-    
-    // Simpan file-file vcf
-    const outputPaths = [];
-    for (let i = 0; i < result.contents.length; i++) {
-      const suffix = result.fileCount > 1 ? `_${i + 1}` : '';
-      const outputPath = path.join(userFolder, `${vcfFileName}${suffix}.vcf`);
-      await fsPromises.writeFile(outputPath, result.contents[i], 'utf8');
-      outputPaths.push(outputPath);
-    }
-
-    const countryNames = {
-      'ID': 'Indonesia',
-      'MY': 'Malaysia',
-      'SG': 'Singapura',
-      'TH': 'Thailand',
-      'VN': 'Vietnam',
-      'PH': 'Filipina',
-      'JP': 'Jepang',
-      'KR': 'Korea Selatan',
-      'CN': 'Tiongkok',
-      'HK': 'Hong Kong',
-      'IN': 'India',
-      'SA': 'Arab Saudi',
-      'AE': 'Uni Emirat Arab',
-      'QA': 'Qatar',
-      'BH': 'Bahrain',
-      'KW': 'Kuwait',
-      'GB': 'Inggris',
-      'FR': 'Prancis',
-      'DE': 'Jerman',
-      'IT': 'Italia',
-      'ES': 'Spanyol',
-      'NL': 'Belanda',
-      'SE': 'Swedia',
-      'NO': 'Norwegia',
-      'US': 'Amerika Serikat',
-      'CA': 'Kanada',
-      'MX': 'Meksiko',
-      'BR': 'Brasil',
-      'AR': 'Argentina',
-      'AU': 'Australia',
-      'NZ': 'Selandia Baru'
-    };
-
-    const countrySummary = Object.entries(result.countrySummary)
-      .map(([code, info]) => {
-        const countryName = countryNames[code] || code;
-        const percentage = ((info.count / result.count) * 100).toFixed(1);
-        return `${countryName}: ${info.count} (${percentage}%)`;
-      })
-      .join('\n');
-
-    // Kirim pesan sukses
-    await bot.sendMessage(chatId, 
-      `✅ Berhasil mengkonversi ${result.count} kontak!\n\n` +
-      `📝 Input: ${txtFileName}.txt\n` +
-      `💾 Output: ${result.fileCount} file VCF\n` +
-      `💼 Nama: ${nameResponse}\n` +
-      `🔢 Mulai dari: ${startNumberResponse}\n` +
-      `📂 Jumlah file: ${result.fileCount}\n\n` +
-      `🌍 Ringkasan Nomor:\n${countrySummary}`);
-
-    // Kirim semua file vcf
-    for (let i = 0; i < outputPaths.length; i++) {
-      try {
-        const suffix = result.fileCount > 1 ? ` (${i + 1}/${result.fileCount})` : '';
-        async function sendFile(chatId, filePath, caption) {
-          return bot.sendDocument(chatId, fs.createReadStream(filePath), {
-            filename: path.basename(filePath),
-            contentType: path.extname(filePath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain',
-            caption: caption,
-            fileOptions: {
-              contentType: 'application/octet-stream'
-            }
-          });
-        }
-        await sendFile(chatId, outputPaths[i], 
-          `📱 File VCF Anda siap diimpor ke smartphone!${suffix}\n` +
-          `ℹ️ Berisi ${Math.ceil(result.count / result.fileCount)} kontak`);
-      } catch (error) {
-        console.error(`Error sending file ${i + 1}:`, error);
-        bot.sendMessage(chatId, `❌ Gagal mengirim file ${i + 1}: ${error.message}`);
-      }
-    }
 
   } catch (error) {
     if (error.code === 'ENOENT') {
       bot.sendMessage(chatId, `❌ File ${txtFileName}.txt tidak ditemukan.`);
-    } else {
-      console.error('Error converting to vcf:', error);
-      bot.sendMessage(chatId, '❌ Gagal mengkonversi file: ' + error.message);
     }
   }
 });
@@ -700,8 +532,8 @@ bot.onText(/\/active/, async (msg) => {
   const message = `📊 User Aktif (${activeUsers.length}):\n\n` +
     activeUsers.map((user, index) => {
       return `${index + 1}. Chat ID: ${user.chatId}\n` +
-             `   ⏰ Terakhir aktif: ${user.lastActive}\n` +
-             `   ⏳ Idle: ${user.idleTime} menit`;
+        `   ⏰ Terakhir aktif: ${user.lastActive}\n` +
+        `   ⏳ Idle: ${user.idleTime} menit`;
     }).join('\n\n');
 
   bot.sendMessage(msg.chat.id, message);
@@ -821,7 +653,7 @@ bot.on('document', async (msg) => {
     // Download dan simpan file
     const fileStream = await bot.getFileStream(file.file_id);
     const writeStream = fs.createWriteStream(filePath);
-    
+
     await new Promise((resolve, reject) => {
       fileStream.pipe(writeStream)
         .on('finish', resolve)
@@ -951,7 +783,7 @@ bot.onText(/\/txt2vcf(?:\s+(.+))?/, async (msg, match) => {
       // Cek apakah input adalah nomor
       const fileIndex = parseInt(response) - 1;
       let txtFileName;
-      
+
       if (!isNaN(fileIndex) && fileIndex >= 0 && fileIndex < txtFiles.length) {
         // User memilih dengan nomor
         txtFileName = path.parse(txtFiles[fileIndex]).name;
@@ -987,10 +819,10 @@ async function processConversion(chatId, txtFileName, userFolder) {
       bot.sendMessage(chatId, `❌ File ${txtFileName}.txt tidak ditemukan.\n\nGunakan /txt2vcf untuk melihat daftar file yang tersedia.`);
       return;
     }
-    
+
     // Baca file dan validasi nomor
     const content = await fsPromises.readFile(inputPath, 'utf8');
-    
+
     // Hapus baris kosong dan whitespace
     const cleanContent = content.split('\n')
       .map(line => line.trim())
@@ -1005,7 +837,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
         .map((item, i) => `${i + 1}. ${item.original} - ${item.error}`)
         .join('\n');
 
-      bot.sendMessage(chatId, 
+      bot.sendMessage(chatId,
         `⚠️ Ditemukan ${validation.invalidNumbers.length} nomor tidak valid:\n\n${invalidList}\n\n` +
         'Format yang didukung:\n' +
         '1. Format lokal: 08xx, 628xx\n' +
@@ -1068,7 +900,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
     const splitCountResponse = await new Promise(resolve => {
       bot.onReplyToMessage(chatId, askSplitCount.message_id, async (splitMsg) => {
         const num = parseInt(splitMsg.text);
-        resolve(isNaN(num) || num < 0 || num > 10 ? (recommendedSplit || 0) : num);
+        resolve(isNaN(num) ? 0 : num);
       });
     });
 
@@ -1097,7 +929,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
       startNumber: startNumberResponse,
       splitCount: splitCountResponse
     });
-    
+
     // Simpan file-file vcf
     const outputPaths = [];
     for (let i = 0; i < result.contents.length; i++) {
@@ -1127,7 +959,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
       .join('\n');
 
     // Kirim pesan sukses
-    await bot.sendMessage(chatId, 
+    await bot.sendMessage(chatId,
       `✅ Berhasil mengkonversi ${result.count} kontak!\n\n` +
       `📝 Input: ${txtFileName}.txt\n` +
       `💾 Output: ${result.fileCount} file VCF\n` +
@@ -1151,7 +983,7 @@ async function processConversion(chatId, txtFileName, userFolder) {
             }
           });
         }
-        await sendFile(chatId, outputPaths[i], 
+        await sendFile(chatId, outputPaths[i],
           `📱 File VCF Anda siap diimpor ke smartphone!${suffix}\n` +
           `ℹ️ Berisi ${contactsInFile} kontak\n\n` +
           `💡 Tips: Gunakan aplikasi kontak bawaan untuk impor`);
@@ -1290,7 +1122,7 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
       case 'old':
         const now = Date.now();
         const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
-        
+
         filesToDelete = files.filter(file => {
           if (!file.toLowerCase().endsWith('.txt') && !file.toLowerCase().endsWith('.vcf')) {
             return false;
@@ -1324,19 +1156,34 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
       `Ketik 'CONFIRM' untuk melanjutkan atau ketik apa saja untuk membatalkan.`,
       {
         reply_markup: {
-          force_reply: true,
-          selective: true
+          // force_reply: true,
+          // selective: true
+          inline_keyboard: [
+            [
+              {
+                text: "Yes",
+                callback_data: "btn_yes"
+              },
+              {
+                text: "No",
+                callback_data: "btn_no"
+              },
+
+            ]
+          ]
         }
       }
     );
 
     const response = await new Promise(resolve => {
-      bot.onReplyToMessage(chatId, confirmMsg.message_id, async (responseMsg) => {
-        resolve(responseMsg.text);
-      });
+      bot.on('callback_query', async (ctx) => {
+        if (ctx.from.id == chatId) {
+          resolve(ctx.data == 'btn_yes');
+        }
+      })
     });
 
-    if (response !== 'CONFIRM') {
+    if (!response) {
       bot.sendMessage(chatId, '❌ Pembersihan dibatalkan.');
       return;
     }
@@ -1369,8 +1216,8 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
 bot.onText(/\/help/, async (msg) => {
   const chatId = msg.chat.id;
 
-  const helpMessage = 
-`*Panduan Penggunaan Bot*
+  const helpMessage =
+    `*Panduan Penggunaan Bot*
 
 1️⃣ *Persiapan File TXT*
 • Buat file txt berisi daftar nomor
@@ -1432,10 +1279,10 @@ bot.onText(/\/setlimit(?:\s+(\d+))(?:\s+(-|reset|\d+))?(?:\s+(-|\d+))?(?:\s+(-|\
 
   // Parse parameters
   const [, targetId, filesStr, fileSizeStr, totalSizeStr] = match;
-  
+
   // Jika hanya chat_id, tampilkan bantuan
   if (!filesStr && !fileSizeStr && !totalSizeStr) {
-    const helpMessage = 
+    const helpMessage =
       '*Pengaturan Batasan Storage*\n\n' +
       'Format: `/setlimit <chat\\_id> <files> <size\\_mb> <total\\_mb>`\n\n' +
       'Contoh:\n' +
@@ -1563,7 +1410,7 @@ bot.onText(/\/resetlimit(?:\s+(\d+))?/, async (msg, match) => {
   try {
     await userManager.resetStorageLimits(targetId);
     const info = userManager.getUserStorageInfo(targetId);
-    const message = 
+    const message =
       '✅ *Berhasil reset limit storage*\n\n' +
       `User ID: \`${targetId}\`\n` +
       'Limit default:\n' +
@@ -1603,7 +1450,7 @@ bot.onText(/\/getlimits/, async (msg) => {
     }
 
     let message = '*Daftar Batasan Storage User*\n\n';
-    
+
     for (const userId of users) {
       const limits = userManager.getStorageLimits(userId);
       message += `👤 User ID: \`${escapeMarkdown(userId)}\`\n`;
@@ -1621,3 +1468,36 @@ bot.onText(/\/getlimits/, async (msg) => {
     });
   }
 });
+
+bot.onText(/\/testing/, async (ctx) => {
+  const to = ctx.chat.id
+  const message = await bot.sendMessage(ctx.chat.id, "Please click on button below.", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "Yes",
+            callback_data: "btn_yes"
+          },
+          {
+            text: "No",
+            callback_data: "btn_no"
+          },
+
+        ]
+      ]
+    }
+  });
+
+  console.log(message)
+
+  bot.on('callback_query', async (ctx) => {
+    if (ctx.from.id === to) {
+      if (ctx.data === "btn_yes") {
+        await bot.sendMessage(ctx.from.id, "You clicked Yes");
+      } else if (ctx.data === "btn_no") {
+        await bot.sendMessage(ctx.from.id, "You clicked No");
+      }
+    }
+  });
+})
