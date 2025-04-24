@@ -738,7 +738,7 @@ process.on('SIGINT', handleShutdown);
 process.on('SIGTERM', handleShutdown);
 
 // Command /txt2vcf - konversi file txt ke vcf
-bot.onText(/\/txt2vcf(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/txt2vcf/, async (msg) => {
   const chatId = msg.chat.id;
 
   // Cek akses user
@@ -747,64 +747,83 @@ bot.onText(/\/txt2vcf(?:\s+(.+))?/, async (msg, match) => {
     return;
   }
 
-  const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
+  // Minta user untuk upload file
+  const uploadMsg = await bot.sendMessage(
+    chatId,
+    '📤 Silakan kirim file .txt yang ingin dikonversi ke VCF',
+    {
+      reply_markup: {
+        force_reply: true,
+        selective: true
+      }
+    }
+  );
 
-  // Jika tidak ada parameter, itu adalah mode pilih file
-  if (!match[1]) {
+  // Tunggu user mengirim file
+  bot.onReplyToMessage(chatId, uploadMsg.message_id, async (fileMsg) => {
+    if (!fileMsg.document) {
+      bot.sendMessage(chatId, '⚠️ Mohon kirim file dalam format dokumen!');
+      return;
+    }
+
+    const file = fileMsg.document;
+
+    // Cek tipe file
+    if (!file.file_name.toLowerCase().endsWith('.txt')) {
+      bot.sendMessage(chatId, '⚠️ Hanya file .txt yang diperbolehkan!');
+      return;
+    }
+
     try {
-      // List semua file txt di folder user
-      const files = await fsPromises.readdir(userFolder);
-      const txtFiles = files.filter(f => f.toLowerCase().endsWith('.txt'));
+      const fileInfo = await bot.getFile(file.file_id);
+      const fileName = sanitize(file.file_name);
+      const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
+      let filePath = path.join(userFolder, fileName);
 
-      if (txtFiles.length === 0) {
-        bot.sendMessage(chatId, '❌ Tidak ada file .txt yang tersedia.\n\nSilakan upload file .txt terlebih dahulu.');
+      // Cek batasan penyimpanan
+      const storage = await getUserStorageInfo(userFolder);
+      const limits = userManager.getStorageLimits(chatId);
+
+      // Cek jumlah file
+      if (storage.fileCount >= limits.MAX_FILES_PER_USER) {
+        bot.sendMessage(chatId, '⚠️ Batas maksimal jumlah file tercapai!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
         return;
       }
 
-      // Tampilkan daftar file yang tersedia
-      const message = '📝 Pilih file yang ingin dikonversi:\n\n' +
-        txtFiles.map((file, i) => `${i + 1}. ${file}`).join('\n') + '\n\n' +
-        'Ketik nomor file atau kirim nama file (tanpa .txt)';
-
-      const selectMsg = await bot.sendMessage(chatId, message, {
-        reply_markup: {
-          force_reply: true,
-          selective: true
-        }
-      });
-
-      // Tunggu respon user
-      const response = await new Promise(resolve => {
-        bot.onReplyToMessage(chatId, selectMsg.message_id, async (fileMsg) => {
-          resolve(fileMsg.text);
-        });
-      });
-
-      // Cek apakah input adalah nomor
-      const fileIndex = parseInt(response) - 1;
-      let txtFileName;
-
-      if (!isNaN(fileIndex) && fileIndex >= 0 && fileIndex < txtFiles.length) {
-        // User memilih dengan nomor
-        txtFileName = path.parse(txtFiles[fileIndex]).name;
-      } else {
-        // User mengetik nama file
-        txtFileName = sanitize(response);
+      // Cek ukuran file
+      if (file.file_size > limits.MAX_FILE_SIZE) {
+        bot.sendMessage(chatId, `⚠️ Ukuran file terlalu besar!\n\nMaksimal: ${formatBytes(limits.MAX_FILE_SIZE)}\nUkuran file: ${formatBytes(file.file_size)}`);
+        return;
       }
 
-      // Lanjut ke proses konversi
+      // Cek total ukuran
+      if (storage.totalSize + file.file_size > limits.MAX_TOTAL_SIZE) {
+        bot.sendMessage(chatId, '⚠️ Total ukuran penyimpanan akan melebihi batas!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
+        return;
+      }
+
+      // Buat folder jika belum ada
+      await fsPromises.mkdir(userFolder, { recursive: true });
+
+      // Download dan simpan file
+      const fileStream = await bot.getFileStream(file.file_id);
+      const writeStream = fs.createWriteStream(filePath);
+
+      await new Promise((resolve, reject) => {
+        fileStream.pipe(writeStream)
+          .on('finish', resolve)
+          .on('error', reject);
+      });
+
+      const txtFileName = path.parse(fileName).name;
+      // Langsung lanjut ke proses konversi
       await processConversion(chatId, txtFileName, userFolder);
 
     } catch (error) {
-      console.error('Error listing files:', error);
-      bot.sendMessage(chatId, '❌ Gagal membaca daftar file: ' + error.message);
+      console.error('Error uploading file:', error);
+      bot.sendMessage(chatId, '❌ Gagal mengunggah file: ' + error.message);
     }
-    return;
-  }
-
-  // Jika ada parameter, itu adalah mode konversi file
-  const txtFileName = sanitize(match[1]);
-  await processConversion(chatId, txtFileName, userFolder);
+  });
 });
 
 // Fungsi untuk memproses konversi txt ke vcf
@@ -849,7 +868,6 @@ async function processConversion(chatId, txtFileName, userFolder) {
     // Tanya nama kontak
     const askName = await bot.sendMessage(chatId,
       '📝 Masukkan nama untuk kontak ini:\n' +
-      'Contoh: Teman SMA, Rekan Kerja, dll\n\n' +
       '💡 Tips: Nama akan digunakan sebagai prefix untuk semua kontak', {
       reply_markup: {
         force_reply: true,
@@ -866,7 +884,6 @@ async function processConversion(chatId, txtFileName, userFolder) {
     // Tanya nomor urut awal
     const askStartNumber = await bot.sendMessage(chatId,
       '🔢 Masukkan nomor urut awal:\n' +
-      'Contoh: 1 (untuk mulai dari 1)\n\n' +
       '💡 Tips: Nomor urut akan ditambahkan setelah nama kontak', {
       reply_markup: {
         force_reply: true,
@@ -877,6 +894,44 @@ async function processConversion(chatId, txtFileName, userFolder) {
     const startNumberResponse = await new Promise(resolve => {
       bot.onReplyToMessage(chatId, askStartNumber.message_id, async (numMsg) => {
         const num = parseInt(numMsg.text);
+        resolve(isNaN(num) ? 1 : num);
+      });
+    });
+
+    // Tanya nama file VCF
+    const defaultVcfName = txtFileName.replace(/[-_\s]+/g, '_').toLowerCase();
+    const askVcfName = await bot.sendMessage(chatId,
+      '💾 Masukkan nama file VCF:\n' +
+      `Default: ${defaultVcfName}\n\n` +
+      'Ketik nama baru atau kirim . (titik) untuk menggunakan nama default', {
+      reply_markup: {
+        force_reply: true,
+        selective: true
+      }
+    });
+
+    const vcfFileName = await new Promise(resolve => {
+      bot.onReplyToMessage(chatId, askVcfName.message_id, async (vcfMsg) => {
+        const name = vcfMsg.text.trim();
+        resolve(name === '.' ? defaultVcfName : sanitize(name));
+      });
+    });
+
+    // Tanya nomor urut file
+    const askFileNumber = await bot.sendMessage(chatId,
+      '🔢 Masukkan nomor urut awal untuk file:\n' +
+      'Contoh: Jika anda ketik 1, file akan dimulai dari _1.vcf\n' +
+      'Default: 1\n\n' +
+      'Ketik angka atau kirim . (titik) untuk menggunakan default', {
+      reply_markup: {
+        force_reply: true,
+        selective: true
+      }
+    });
+
+    const fileStartNumber = await new Promise(resolve => {
+      bot.onReplyToMessage(chatId, askFileNumber.message_id, async (numMsg) => {
+        const num = numMsg.text.trim() === '.' ? 1 : parseInt(numMsg.text);
         resolve(isNaN(num) ? 1 : num);
       });
     });
@@ -904,36 +959,18 @@ async function processConversion(chatId, txtFileName, userFolder) {
       });
     });
 
-    // Tanya nama file VCF
-    const defaultVcfName = txtFileName.replace(/[-_\s]+/g, '_').toLowerCase();
-    const askVcfName = await bot.sendMessage(chatId,
-      '💾 Masukkan nama file VCF:\n' +
-      `Default: ${defaultVcfName}\n\n` +
-      'Ketik nama baru atau kirim . (titik) untuk menggunakan nama default', {
-      reply_markup: {
-        force_reply: true,
-        selective: true
-      }
-    });
-
-    const vcfFileName = await new Promise(resolve => {
-      bot.onReplyToMessage(chatId, askVcfName.message_id, async (vcfMsg) => {
-        const name = vcfMsg.text.trim();
-        resolve(name === '.' ? defaultVcfName : sanitize(name));
-      });
-    });
-
     // Konversi ke vcf dengan nama dan nomor urut yang diberikan
     const result = await vcfConverter.convertTxtToVcf(inputPath, {
       name: nameResponse,
       startNumber: startNumberResponse,
-      splitCount: splitCountResponse
+      splitCount: splitCountResponse,
+      fileStartNumber: fileStartNumber
     });
 
     // Simpan file-file vcf
     const outputPaths = [];
     for (let i = 0; i < result.contents.length; i++) {
-      const suffix = result.fileCount > 1 ? `_${i + 1}` : '';
+      const suffix = result.fileCount > 1 ? ` ${i + fileStartNumber}` : '';
       const outputPath = path.join(userFolder, `${vcfFileName}${suffix}.vcf`);
       await fsPromises.writeFile(outputPath, result.contents[i], 'utf8');
       outputPaths.push(outputPath);
