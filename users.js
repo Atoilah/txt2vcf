@@ -22,6 +22,7 @@ class UserManager {
     this.users = new Set();
     this.activeUsers = new Map(); // Menyimpan user aktif dan timestamp aktivitas terakhir
     this.userLimits = new Map(); // Stores custom storage limits for users
+    this.userStates = new Map(); // Stores user states for multi-step operations
     
     this.loadUsers();
     this.loadUserLimits();
@@ -200,10 +201,11 @@ class UserManager {
 
   // Hapus user yang tidak aktif selama lebih dari 30 menit
   cleanInactiveUsers() {
-    const thirtyMinutesAgo = Date.now() - this.maxIdleTime * 60 * 1000;
-    for (const [chatId, lastActive] of this.activeUsers.entries()) {
-      if (lastActive < thirtyMinutesAgo) {
-        this.activeUsers.delete(chatId);
+    const now = Date.now();
+    for (const [userId, lastActive] of this.activeUsers) {
+      if (now - lastActive > this.maxIdleTime * 60 * 1000) {
+        this.activeUsers.delete(userId);
+        this.userStates.delete(userId); // Clean up any lingering states
       }
     }
   }
@@ -225,6 +227,21 @@ class UserManager {
       maxFileSize: Math.floor(limits.MAX_FILE_SIZE / (1024 * 1024)), // MB
       maxTotalSize: Math.floor(limits.MAX_TOTAL_SIZE / (1024 * 1024)) // MB
     };
+  }
+
+  // Get user state for multi-step operations
+  getUserState(chatId) {
+    return this.userStates.get(chatId.toString());
+  }
+
+  // Set user state for multi-step operations
+  setUserState(chatId, state) {
+    this.userStates.set(chatId.toString(), state);
+  }
+
+  // Clear user state when operation is complete
+  clearUserState(chatId) {
+    this.userStates.delete(chatId.toString());
   }
 }
 

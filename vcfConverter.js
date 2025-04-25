@@ -191,6 +191,55 @@ END:VCARD
       }, {})
     };
   }
+
+  // Merge multiple VCF files into one
+  async mergeVcfFiles(filePaths, outputName) {
+    try {
+      let mergedContent = '';
+      let totalContacts = 0;
+      const countries = {};
+
+      // Process each file
+      for (const filePath of filePaths) {
+        const content = await fs.readFile(filePath, 'utf8');
+        const vcards = content.split('BEGIN:VCARD')
+          .filter(card => card.trim())
+          .map(card => 'BEGIN:VCARD' + card.trim());
+        
+        // Add each vCard to merged content
+        for (const vcard of vcards) {
+          // Extract phone number to track country stats
+          const phoneMatch = vcard.match(/TEL[^:]*:(.+)/);
+          if (phoneMatch) {
+            const number = phoneMatch[1].trim();
+            const cleanNumber = this.cleanPhoneNumber(number);
+            const country = this.getCountryInfo(cleanNumber);
+            if (country) {
+              countries[country.name] = (countries[country.name] || 0) + 1;
+            }
+          }
+          
+          mergedContent += vcard + '\n';
+          totalContacts++;
+        }
+      }
+
+      return {
+        content: mergedContent.trim(),
+        stats: {
+          totalContacts,
+          countries: Object.entries(countries)
+            .sort(([,a], [,b]) => b - a)
+            .reduce((acc, [country, count]) => {
+              acc[country] = count;
+              return acc;
+            }, {})
+        }
+      };
+    } catch (error) {
+      throw new Error(`Error merging VCF files: ${error.message}`);
+    }
+  }
 }
 
 module.exports = VcfConverter;
