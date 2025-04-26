@@ -173,6 +173,79 @@ Bot Telegram untuk mengkonversi daftar nomor telepon dari file TXT menjadi file 
 - Minimal digit nomor: 10
 - Maksimal split file: 10
 
+## 🔧 Technical Details
+
+### Architecture
+- **Core Components**
+  - `index.js`: Main bot logic and command handlers
+  - `users.js`: User management and storage limits
+  - `vcfConverter.js`: TXT to VCF conversion logic
+
+### Storage System
+- **File Structure**
+  - User files stored in `userfiles/<chat_id>/`
+  - User limits in `user_limits.json`
+  - Active users in `users.txt`
+
+### Security & Limits
+- Default storage limits:
+  - 10 files per user
+  - 1MB per file
+  - 5MB total per user
+- Owner-only commands for user management
+- File type validation (.txt, .vcf)
+- Sanitized filenames
+
+### Dependencies
+- **Core**
+  - `node-telegram-bot-api`: Telegram Bot API interface
+  - `dotenv`: Environment configuration
+  - `uuid`: Unique file ID generation
+  - `sanitize-filename`: Safe file handling
+- **Development**
+  - `nodemon`: Auto-restart during development
+
+### Environment Setup
+```bash
+# Required environment variables
+BOT_TOKEN=your_telegram_bot_token
+OWNER_ID=your_telegram_user_id
+
+# Optional configurations
+MAX_FILE_SIZE=1048576  # 1MB in bytes
+MAX_TOTAL_SIZE=5242880 # 5MB in bytes
+MAX_FILES=10           # Max files per user
+```
+
+### Running the Bot
+```bash
+# Install dependencies
+npm install
+
+# Development mode with auto-restart
+npm run dev
+
+# Production mode
+npm start
+
+# Run tests
+npm test
+```
+
+### Error Handling
+- File size validation
+- Storage quota checks
+- File format validation
+- Duplicate file detection
+- Network error recovery
+- Invalid phone number handling
+
+### Performance
+- Async file operations
+- Streaming file uploads/downloads
+- Batch processing for large files
+- Memory-efficient file handling
+
 ## 🔧 Error Handling & Reliability
 1. **Polling Error Recovery**
    - Automatic detection of conflicting bot instances
