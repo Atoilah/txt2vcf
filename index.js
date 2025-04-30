@@ -798,8 +798,7 @@ bot.onText(/\/txt2vcf/, async (msg) => {
         bot.sendMessage(chatId, '⚠️ Total ukuran penyimpanan akan melebihi batas!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
         return;
       }
-
-      // Buat folder jika belum ada
+      // Buat folder user jika belum ada
       await fsPromises.mkdir(userFolder, { recursive: true });
 
       // Download dan simpan file
@@ -1278,39 +1277,39 @@ bot.onText(/\/checklimit(?:\s+(\d+))?/, async (msg, match) => {
     if (!userManager.hasUser(targetId)) {
       await bot.sendMessage(chatId, `⚠️ User dengan ID ${escapeMarkdown(targetId)} tidak terdaftar\\.`, {
         parse_mode: 'MarkdownV2'
-      });
-      return;
-    }
-
-    // Ambil info batasan storage
-    const limits = userManager.getStorageLimits(targetId);
-
-    // Ambil info penggunaan storage
-    const userFolder = path.join(__dirname, 'userfiles', targetId);
-    const storage = await getUserStorageInfo(userFolder);
-
-    // Format pesan
-    const message = [
-      '*Info Batasan Storage User*\\n',
-      `User ID: \`${escapeMarkdown(targetId)}\`\\n`,
-      '*Batasan:*',
-      `• Files: ${escapeMarkdown(limits.MAX_FILES_PER_USER.toString())} file`,
-      `• Size/file: ${escapeMarkdown(formatSizeMB(limits.MAX_FILE_SIZE))} MB`,
-      `• Total size: ${escapeMarkdown(formatSizeMB(limits.MAX_TOTAL_SIZE))} MB\\n`,
-      '*Penggunaan:*',
-      `• Files: ${escapeMarkdown(storage.fileCount.toString())}/${escapeMarkdown(limits.MAX_FILES_PER_USER.toString())}`,
-      `• Total size: ${escapeMarkdown(formatBytes(storage.totalSize))}/${escapeMarkdown(formatBytes(limits.MAX_TOTAL_SIZE))}`,
-      `• Persentase: ${escapeMarkdown(Math.round((storage.totalSize / limits.MAX_TOTAL_SIZE) * 100).toString())}%`
-    ].join('\n');
-
-    await bot.sendMessage(chatId, message, {
-      parse_mode: 'MarkdownV2'
     });
-  } catch (error) {
-    await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`, {
-      parse_mode: 'MarkdownV2'
-    });
+    return;
   }
+
+  // Ambil info batasan storage
+  const limits = userManager.getStorageLimits(targetId);
+
+  // Ambil info penggunaan storage
+  const userFolder = path.join(__dirname, 'userfiles', targetId);
+  const storage = await getUserStorageInfo(userFolder);
+
+  // Format pesan
+  const message = [
+    '*Info Batasan Storage User*\\n',
+    `User ID: \`${escapeMarkdown(targetId)}\`\\n`,
+    '*Batasan:*',
+    `• Files: ${escapeMarkdown(limits.MAX_FILES_PER_USER.toString())} file`,
+    `• Size/file: ${escapeMarkdown(formatSizeMB(limits.MAX_FILE_SIZE))} MB`,
+    `• Total size: ${escapeMarkdown(formatSizeMB(limits.MAX_TOTAL_SIZE))} MB\\n`,
+    '*Penggunaan:*',
+    `• Files: ${escapeMarkdown(storage.fileCount.toString())}/${escapeMarkdown(limits.MAX_FILES_PER_USER.toString())}`,
+    `• Total size: ${escapeMarkdown(formatBytes(storage.totalSize))}/${escapeMarkdown(formatBytes(limits.MAX_TOTAL_SIZE))}`,
+    `• Persentase: ${escapeMarkdown(Math.round((storage.totalSize / limits.MAX_TOTAL_SIZE) * 100).toString())}%`
+  ].join('\n');
+
+  await bot.sendMessage(chatId, message, {
+    parse_mode: 'MarkdownV2'
+  });
+} catch (error) {
+  await bot.sendMessage(chatId, `❌ Error: ${escapeMarkdown(error.message)}`, {
+    parse_mode: 'MarkdownV2'
+  });
+}
 });
 
 // Command /clean - membersihkan storage
@@ -1495,7 +1494,7 @@ bot.onText(/\/help/, async (msg) => {
 ✅ Benar:
 0812xxxxxxxx
 628xxxxxxxxx
-+62812xxxxxxx
++62 812 xxxx
 
 ❌ Salah:
 812xxxxxxxx (tanpa 0)
@@ -1587,9 +1586,6 @@ bot.onText(/\/setlimit(?:\s+(\d+))(?:\s+(-|reset|\d+))?(?:\s+(-|\d+))?(?:\s+(-|\
       return;
     }
 
-    // Get current limits for reference
-    const currentLimits = userManager.getStorageLimits(targetId);
-
     // Parse parameters, keeping current values if '-' is specified
     const files = filesStr === '-' ? null : parseInt(filesStr);
     const fileSize = fileSizeStr === '-' ? null : parseInt(fileSizeStr);
@@ -1607,8 +1603,8 @@ bot.onText(/\/setlimit(?:\s+(\d+))(?:\s+(-|reset|\d+))?(?:\s+(-|\d+))?(?:\s+(-|\
     }
 
     // Check file size vs total size
-    const effectiveFileSize = fileSize || Math.floor(currentLimits.MAX_FILE_SIZE / (1024 * 1024));
-    const effectiveTotalSize = totalSize || Math.floor(currentLimits.MAX_TOTAL_SIZE / (1024 * 1024));
+    const effectiveFileSize = fileSize || Math.floor(userManager.getStorageLimits(targetId).MAX_FILE_SIZE / (1024 * 1024));
+    const effectiveTotalSize = totalSize || Math.floor(userManager.getStorageLimits(targetId).MAX_TOTAL_SIZE / (1024 * 1024));
     if (effectiveFileSize > effectiveTotalSize) {
       throw new Error('Ukuran per file tidak boleh lebih besar dari total ukuran');
     }
@@ -1946,127 +1942,6 @@ bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userState = userManager.getUserState(chatId);
 
-  if (!userState) return;
-
-  const userFolder = path.join(process.cwd(), 'userfiles', chatId.toString());
-
-  if (query.data === 'merge_select_numbers') {
-    try {
-      // Create user directory if it doesn't exist
-      try {
-        await fsPromises.access(userFolder);
-      } catch {
-        await fsPromises.mkdir(userFolder, { recursive: true });
-      }
-
-      // Get list of VCF files
-      const files = await fsPromises.readdir(userFolder);
-      const vcfFiles = files.filter(file => file.toLowerCase().endsWith('.vcf'));
-
-      if (vcfFiles.length === 0) {
-        await bot.sendMessage(chatId, '❌ Tidak ada file VCF yang tersedia. Silakan upload file terlebih dahulu.');
-        userManager.clearUserState(chatId);
-        return;
-      }
-
-      // Update state for file selection
-      userManager.setUserState(chatId, {
-        ...userState,
-        action: 'merge_select_files',
-        availableFiles: vcfFiles,
-        selectedFiles: []
-      });
-
-      // Show file selection message with checkboxes
-      await showFileSelectionMessage(chatId, vcfFiles);
-      
-      // Update state with file list
-      userManager.setUserState(chatId, {
-        ...userState,
-        action: 'merge_select_files',
-        availableFiles: vcfFiles,
-        selectedFiles: []
-      });
-
-    } catch (error) {
-      console.error('Error listing files:', error);
-      bot.sendMessage(chatId, '❌ Gagal membaca daftar file');
-      userManager.clearUserState(chatId);
-    }
-  } else if (query.data === 'merge_upload') {
-    // Create user directory if it doesn't exist
-    try {
-      await fsPromises.access(userFolder);
-    } catch {
-      await fsPromises.mkdir(userFolder, { recursive: true });
-    }
-
-    userManager.setUserState(chatId, {
-      ...userState,
-      action: 'merge_upload_files'
-    });
-    
-    bot.sendMessage(chatId, 
-      '📤 Silakan kirim file VCF yang ingin digabungkan.\n' +
-      'Kirim /done jika sudah selesai mengirim semua file.'
-    );
-
-    // Update state with file list
-    userManager.setUserState(chatId, {
-      ...userState,
-      action: 'merge_upload_files',
-      selectedFiles: []
-    });
-    
-  } else if (query.data.startsWith('select_')) {
-    const fileName = query.data.replace('select_', '');
-    const state = userManager.getUserState(chatId);
-    
-    if (state && state.action === 'merge_select_files') {
-      const selectedFiles = state.selectedFiles || [];
-      const fileIndex = selectedFiles.indexOf(fileName);
-      
-      if (fileIndex === -1) {
-        selectedFiles.push(fileName);
-      } else {
-        selectedFiles.splice(fileIndex, 1);
-      }
-      
-      // Update state
-      userManager.setUserState(chatId, {
-        ...state,
-        selectedFiles
-      });
-      
-      // Update selection message
-      await showFileSelectionMessage(chatId, state.availableFiles, selectedFiles);
-    }
-  } else if (query.data === 'merge_done') {
-    const state = userManager.getUserState(chatId);
-    
-    if (state && state.selectedFiles.length >= 2) {
-      await mergeSelectedFiles(chatId, state.selectedFiles, state.outputName);
-    } else {
-      bot.sendMessage(chatId, '❌ Pilih minimal 2 file untuk digabungkan');
-    }
-  } else if (query.data === 'merge_cancel') {
-    // Clear user state and send cancellation message
-    userManager.clearUserState(chatId);
-    await bot.editMessageText('❌ Penggabungan file dibatalkan', {
-      chat_id: chatId,
-      message_id: query.message.message_id
-    });
-  }
-  
-  // Answer callback query to remove loading state
-  bot.answerCallbackQuery(query.id);
-});
-
-// Handle callback queries
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const userState = userManager.getUserState(chatId);
-
   if (!userState) {
     await bot.answerCallbackQuery(query.id);
     return;
@@ -2194,3 +2069,210 @@ bot.on('callback_query', async (query) => {
     userManager.clearUserState(chatId);
   }
 });
+
+// Command /createvcf - buat file vcf dari pesan
+bot.onText(/\/createvcf(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+
+  // Cek akses user
+  if (!userManager.hasUser(chatId) && !isOwner(msg)) {
+    bot.sendMessage(chatId, '⛔ Maaf, Anda tidak memiliki akses. Gunakan /start untuk mendaftar.');
+    return;
+  }
+
+  // Cek format input
+  const input = match[1];
+  if (!input) {
+    bot.sendMessage(chatId, 
+      '📝 Format:\n' +
+      '1. Multiple kontak (nama berbeda):\n' +
+      '   /createvcf nama|nomor[; nama|nomor]...\n\n' +
+      '2. Multiple kontak (nama sama):\n' +
+      '   /createvcf nama >> nomor[; nomor]...\n\n' +
+      'Contoh:\n' +
+      '• Nama berbeda:\n' +
+      '  /createvcf John|081234567890; Alice|+6281234567890\n\n' +
+      '• Nama sama:\n' +
+      '  /createvcf John >> 081234567890; +6281234567890; 628123456789\n' +
+      '  ➡️ Akan menjadi: John, John 2, John 3\n\n' +
+      'Catatan:\n' +
+      '• Format 1: Gunakan | antara nama dan nomor\n' +
+      '• Format 2: Gunakan >> antara nama dan daftar nomor\n' +
+      '• Gunakan ; untuk memisahkan antar nomor\n' +
+      '• Nomor minimal 10 digit\n' +
+      '• Mendukung format: 08xx, 628xx, +62xx\n' +
+      '• Nama yang sama akan otomatis diberi nomor urut'
+    );
+    return;
+  }
+
+  try {
+    let rawContacts = [];
+
+    // Cek format input (format biasa atau format nama sama)
+    if (input.includes('>>')) {
+      // Format nama sama: "nama >> nomor1; nomor2; nomor3"
+      const [name, numbersList] = input.split('>>').map(s => s.trim());
+      if (!name || !numbersList) {
+        throw new Error('Format tidak valid. Gunakan: nama >> nomor1; nomor2; ...');
+      }
+
+      // Parse semua nomor
+      const numbers = numbersList.split(';').map(n => n.trim());
+      rawContacts = numbers.map(number => ({ name, number }));
+    } else {
+      // Format biasa: "nama1|nomor1; nama2|nomor2"
+      rawContacts = input.split(';').map(contact => {
+        const [name, number] = contact.trim().split('|').map(s => s.trim());
+        if (!name || !number) {
+          throw new Error('Format tidak valid. Gunakan: nama|nomor[; nama|nomor]...');
+        }
+        return { name, number };
+      });
+    }
+
+    // Validate and clean phone numbers
+    rawContacts = rawContacts.map(contact => {
+      const cleanedNumber = vcfConverter.cleanPhoneNumber(contact.number);
+      if (!cleanedNumber || cleanedNumber.length < 10) {
+        throw new Error(`Nomor tidak valid untuk kontak "${contact.name}". Minimal 10 digit.`);
+      }
+      return { ...contact, number: cleanedNumber };
+    });
+
+    if (rawContacts.length === 0) {
+      throw new Error('Minimal masukkan 1 kontak');
+    }
+
+    // Process duplicate names
+    const nameCount = {};
+    const contacts = rawContacts.map(contact => {
+      const baseName = contact.name;
+      nameCount[baseName] = (nameCount[baseName] || 0) + 1;
+      
+      return {
+        ...contact,
+        name: nameCount[baseName] === 1 ? baseName : `${baseName} ${nameCount[baseName]}`
+      };
+    });
+
+    // Ask user for filename preference
+    const defaultFilename = contacts.length === 1 ? 
+      `${sanitize(contacts[0].name)}_${Date.now()}.vcf` :
+      `contacts_${contacts.length}_${Date.now()}.vcf`;
+
+    // Generate preview with numbered names
+    const contactSummary = contacts.map((c, i) => {
+      const isNumbered = c.name !== rawContacts[i].name;
+      return `${i + 1}. ${c.name}${isNumbered ? ' 🔄' : ''} (${c.number})`;
+    }).join('\n');
+
+    await bot.sendMessage(chatId,
+      `📝 Kontak yang akan dibuat (${contacts.length}):\n\n${contactSummary}\n\n` +
+      (contacts.some((c, i) => c.name !== rawContacts[i].name) ? 
+        '🔄 Nama yang sama telah diberi nomor urut\n\n' : '') +
+      `Pilih nama file:\n` +
+      `• Default: ${defaultFilename}`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Gunakan nama default', callback_data: `vcf_default_multi` },
+              { text: '✏️ Custom nama file', callback_data: `vcf_custom_multi` }
+            ]
+          ]
+        }
+      }
+    );
+
+    // Update user state
+    userManager.setUserState(chatId, {
+      action: 'create_vcf',
+      data: {
+        contacts,
+        defaultFilename
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating VCF:', error);
+    bot.sendMessage(chatId, '❌ ' + error.message);
+  }
+});
+
+// Handle VCF filename selection
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const userState = userManager.getUserState(chatId);
+
+  if (!userState || userState.action !== 'create_vcf') return;
+
+  await bot.answerCallbackQuery(query.id);
+
+  if (query.data === 'vcf_default_multi') {
+    // Use default filename
+    await createAndSendMultiVcf(chatId, userState.data.contacts, userState.data.defaultFilename);
+    userManager.clearUserState(chatId);
+  } else if (query.data === 'vcf_custom_multi') {
+    // Ask for custom filename
+    await bot.sendMessage(chatId, 
+      '✏️ Kirim nama file yang diinginkan (tanpa ekstensi .vcf)\n' +
+      'Contoh: kontak_grup_a'
+    );
+    // Update state to wait for filename
+    userManager.setUserState(chatId, {
+      ...userState,
+      action: 'create_vcf_filename'
+    });
+  }
+});
+
+// Handle custom filename input
+bot.on('text', async (msg) => {
+  const chatId = msg.chat.id;
+  const userState = userManager.getUserState(chatId);
+
+  if (!userState || userState.action !== 'create_vcf_filename') return;
+
+  const customName = sanitize(msg.text.trim());
+  if (!customName) {
+    bot.sendMessage(chatId, '❌ Nama file tidak valid. Silakan coba lagi.');
+    return;
+  }
+
+  await createAndSendMultiVcf(chatId, userState.data.contacts, `${customName}.vcf`);
+  userManager.clearUserState(chatId);
+});
+
+// Helper function to create and send VCF file with multiple contacts
+async function createAndSendMultiVcf(chatId, contacts, filename) {
+  try {
+    // Generate VCF content for all contacts
+    const vcfContent = contacts.map(contact => 
+      vcfConverter.vCardTemplate
+        .replace(/{name}/g, contact.name)
+        .replace(/{number}/g, contact.number)
+    ).join('\n');
+
+    // Create user folder if not exists
+    const userFolder = path.join(process.cwd(), 'userfiles', chatId.toString());
+    await fsPromises.mkdir(userFolder, { recursive: true });
+
+    // Save VCF file
+    const filePath = path.join(userFolder, filename);
+    await fsPromises.writeFile(filePath, vcfContent);
+
+    // Generate contact summary
+    const summary = contacts.map((c, i) => `${i + 1}. ${c.name} (${c.number})`).join('\n');
+
+    // Send file to user
+    await bot.sendDocument(chatId, fs.createReadStream(filePath), {
+      filename: filename,
+      caption: `✅ File VCF berhasil dibuat dengan ${contacts.length} kontak:\n\n${summary}\n\nFile: ${filename}`,
+      contentType: 'text/vcard'
+    });
+  } catch (error) {
+    console.error('Error creating VCF:', error);
+    bot.sendMessage(chatId, '❌ Gagal membuat file: ' + error.message);
+  }
+}
