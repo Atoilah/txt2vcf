@@ -69,7 +69,7 @@ const isOwner = (msg) => msg.from.id.toString() === ownerId;
 
 // Helper function to escape special characters for MarkdownV2
 const escapeMarkdown = (text) => {
-  return text.toString().replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+  return text.toString().replace(/[_*[\]()~`>#+=|{}.!\\-]/g, '\\$&');
 };
 
 // Helper function to format size to MB
