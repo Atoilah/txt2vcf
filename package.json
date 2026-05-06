@@ -11,11 +11,8 @@
   },
   "dependencies": {
     "dotenv": "^16.3.1",
-    "form-data": "^4.0.4",
-    "node-fetch": "^2.7.0",
     "node-telegram-bot-api": "^0.64.0",
     "nodemon": "^3.0.1",
-    "sanitize-filename": "^1.6.3",
-    "uuid": "^11.1.0"
+    "sanitize-filename": "^1.6.3"
   }
 }

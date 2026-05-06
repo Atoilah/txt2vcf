@@ -67,85 +67,62 @@ END:VCARD
   async convertTxtToVcf(inputPath, options = {}) {
     const { name = 'Contact', startNumber = 1, splitCount = 0 } = options;
 
-    // Baca file txt
     const content = await fs.readFile(inputPath, 'utf8');
-    const lines = content.split('\n').filter(line => line.trim());
+    const lines = content
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
 
-    let vcfContents = [];
+    const vcfContents = [];
+    const countrySummary = {};
     let currentVcf = '';
+    let currentInFile = 0;
     let count = 0;
-    let fileCount = 0;
-    const countries = {};
-    let current = 0;
 
-    // Proses setiap baris
+    const flushCurrentFile = () => {
+      if (currentVcf) {
+        vcfContents.push(currentVcf.trim() + '\n');
+        currentVcf = '';
+        currentInFile = 0;
+      }
+    };
+
     for (const line of lines) {
       const cleanNumber = this.cleanPhoneNumber(line);
-
       if (!cleanNumber) continue;
 
-      // Deteksi negara
-      const country = this.getCountryInfo(cleanNumber);
-      countries[country.name] = (countries[country.name] || 0) + 1;
+      const countryInfo = this.getCountryInfo(cleanNumber);
+      if (countryInfo) {
+        countrySummary[countryInfo.iso] = (countrySummary[countryInfo.iso] || 0) + 1;
+      }
 
-      // Format nomor dengan kode negara
+      const contactNumber = startNumber + count;
       const formattedNumber = `+${cleanNumber}`;
 
-      // Buat vCard untuk nomor ini
-      const vcard = [
+      currentVcf += [
         'BEGIN:VCARD',
         'VERSION:3.0',
-        `N:;${name} ${startNumber + count};;;;`,
-        `FN:${name} ${startNumber + count}`,
+        `N:;${name} ${contactNumber};;;`,
+        `FN:${name} ${contactNumber}`,
         `TEL;TYPE=CELL:${formattedNumber}`,
-        'END:VCARD'
+        'END:VCARD',
+        ''
       ].join('\n');
 
-      currentVcf += vcard + '\n\n';
       count++;
+      currentInFile++;
 
-      if (splitCount > 0 && current + 1 >= splitCount) {
-        vcfContents.push(currentVcf);
-        currentVcf = '';
-        fileCount++;
-        current = 0;
-        continue;
-      }
-      current++
-    }
-
-    // Simpan sisa kontak jika ada
-    if (currentVcf) {
-      vcfContents.push(currentVcf);
-      fileCount++;
-    }
-
-    // Jika tidak dipecah, gabung semua jadi satu
-    if (splitCount <= 0) {
-      vcfContents = [currentVcf];
-      fileCount = 1;
-    }
-
-    // Buat ringkasan negara
-    const numbers = lines.map(line => line.trim()).filter(line => line.length > 0);
-    const countrySummary = {};
-    for (const number of numbers) {
-      try {
-        const cleaned = this.cleanPhoneNumber(number);
-        const countryInfo = this.getCountryInfo(cleaned);
-        if (countryInfo) {
-          const isoCode = countryInfo.iso;
-          countrySummary[isoCode] = (countrySummary[isoCode] || 0) + 1;
-        }
-      } catch (error) {
-        // ignore error
+      if (splitCount > 0 && currentInFile >= splitCount) {
+        flushCurrentFile();
       }
     }
+
+    flushCurrentFile();
 
     return {
-      contents: vcfContents,
+      contents: vcfContents.length > 0 ? vcfContents : [''],
       count,
-      fileCount,
+      fileCount: Math.max(vcfContents.length, 1),
       countrySummary
     };
   }

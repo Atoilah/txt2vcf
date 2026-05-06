@@ -1,7 +1,8 @@
 // Load environment variables
 require('dotenv').config();
 
-const fs = require('fs').promises;
+const fsSync = require('fs');
+const fs = fsSync.promises;
 const path = require('path');
 
 // Default storage limits
@@ -116,7 +117,7 @@ class UserManager {
 
   async loadUsers() {
     try {
-      const data = await fs.readFile(this.usersFile, 'utf8');
+      const data = fsSync.readFileSync(this.usersFile, 'utf8');
       const lines = data.split('\n').filter(Boolean);
       
       this.users = new Set();
@@ -137,7 +138,7 @@ class UserManager {
     } catch (error) {
       if (error.code === 'ENOENT') {
         console.log('Users file not found, creating new one');
-        await this.saveUsers();
+        fsSync.writeFileSync(this.usersFile, '');
       } else {
         console.error('Error loading users:', error);
       }
@@ -146,9 +147,9 @@ class UserManager {
 
   async loadUserLimits() {
     try {
-      if (await fs.access(this.usersLimitsFile).then(() => true).catch(() => false)) {
-        const data = await fs.readFile(this.usersLimitsFile, 'utf8');
-        const limitsData = JSON.parse(data);
+      if (fsSync.existsSync(this.usersLimitsFile)) {
+        const data = fsSync.readFileSync(this.usersLimitsFile, 'utf8');
+        const limitsData = JSON.parse(data || '{}');
         Object.entries(limitsData).forEach(([chatId, limits]) => {
           this.userLimits.set(chatId, {
             MAX_FILES_PER_USER: limits.files,

@@ -5,21 +5,20 @@ const TelegramBot = require('node-telegram-bot-api');
 const UserManager = require('./users');
 const fs = require('fs');
 const fsPromises = fs.promises;
-const FormData = require('form-data');
 const path = require('path');
 const sanitize = require('sanitize-filename');
 const os = require('os');
 const process = require('process');
 const VcfConverter = require('./vcfConverter');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
 // Format bytes to human readable
 function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
+  const value = Number(bytes) || 0;
+  if (value <= 0) return '0 B';
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(value) / Math.log(k)), sizes.length - 1);
+  return `${(value / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
 // Inisialisasi converter
@@ -65,7 +64,7 @@ bot.on('polling_error', (error) => {
 const userManager = new UserManager();
 
 // Fungsi untuk cek apakah pengirim adalah owner
-const isOwner = (msg) => msg.from.id.toString() === ownerId;
+const isOwner = (msg) => msg?.from?.id?.toString() === ownerId;
 
 // Helper function to escape special characters for MarkdownV2
 const escapeMarkdown = (text) => {
@@ -76,6 +75,177 @@ const escapeMarkdown = (text) => {
 const formatSizeMB = (bytes) => {
   return (bytes / (1024 * 1024)).toFixed(1);
 };
+
+const ALLOWED_FILE_EXTENSIONS = ['.txt', '.vcf'];
+const USERFILES_DIR = path.join(__dirname, 'userfiles');
+
+function getUserFolder(chatId) {
+  return path.join(USERFILES_DIR, chatId.toString());
+}
+
+function hasAccess(msg) {
+  const chatId = msg.chat.id;
+  return userManager.hasUser(chatId) || isOwner(msg);
+}
+
+async function fileExists(filePath) {
+  try {
+    await fsPromises.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function downloadTelegramFile(fileId, outputPath) {
+  await fsPromises.mkdir(path.dirname(outputPath), { recursive: true });
+  const fileStream = await bot.getFileStream(fileId);
+  const writeStream = fs.createWriteStream(outputPath);
+  await new Promise((resolve, reject) => {
+    fileStream.pipe(writeStream)
+      .on('finish', resolve)
+      .on('error', reject);
+  });
+}
+
+
+// Setting aman untuk multi-user dan retry kirim file
+const SEND_FILE_MAX_RETRIES = 3;
+const SEND_FILE_RETRY_DELAY_MS = 3000; // 3 detik, masih dalam saran 2-5 detik
+const SEND_FILE_DELAY_BETWEEN_FILES_MS = 1500; // 1,5 detik antar file
+const PROCESS_TIMEOUT_MS = 15 * 60 * 1000; // 15 menit
+const processTimeouts = new Map();
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeChatId(chatId) {
+  return chatId.toString();
+}
+
+function getProcessLabel(state) {
+  return state?.processName || state?.action || 'proses lain';
+}
+
+function isUserProcessActive(chatId) {
+  const state = userManager.getUserState(chatId);
+  return Boolean(state?.processLocked);
+}
+
+async function startUserProcess(chatId, processName, state = {}, timeoutMs = PROCESS_TIMEOUT_MS) {
+  const existing = userManager.getUserState(chatId);
+  if (existing?.processLocked) {
+    await bot.sendMessage(
+      chatId,
+      `⏳ Masih ada proses "${getProcessLabel(existing)}" yang belum selesai.\n\n` +
+      'Selesaikan dulu proses tersebut, atau ketik /cancel untuk membatalkannya.'
+    );
+    return false;
+  }
+
+  const lockedState = {
+    ...state,
+    processLocked: true,
+    processName,
+    startedAt: Date.now(),
+    processTimeoutMs: timeoutMs
+  };
+  userManager.setUserState(chatId, lockedState);
+  scheduleProcessTimeout(chatId, timeoutMs);
+  return true;
+}
+
+function updateUserProcess(chatId, patch = {}) {
+  const existing = userManager.getUserState(chatId) || {};
+  const nextState = {
+    ...existing,
+    ...patch,
+    processLocked: existing.processLocked || patch.processLocked || false,
+    processName: patch.processName || existing.processName,
+    processTimeoutMs: patch.processTimeoutMs || existing.processTimeoutMs
+  };
+
+  userManager.setUserState(chatId, nextState);
+
+  if (nextState.processLocked) {
+    scheduleProcessTimeout(chatId, nextState.processTimeoutMs || PROCESS_TIMEOUT_MS);
+  }
+}
+
+function finishUserProcess(chatId) {
+  const key = normalizeChatId(chatId);
+  const timeout = processTimeouts.get(key);
+  if (timeout) clearTimeout(timeout);
+  processTimeouts.delete(key);
+  userManager.clearUserState(chatId);
+}
+
+function scheduleProcessTimeout(chatId, timeoutMs = PROCESS_TIMEOUT_MS) {
+  const key = normalizeChatId(chatId);
+  const oldTimeout = processTimeouts.get(key);
+  if (oldTimeout) clearTimeout(oldTimeout);
+
+  const timeout = setTimeout(() => {
+    const state = userManager.getUserState(chatId);
+    if (state?.processLocked) {
+      userManager.clearUserState(chatId);
+      processTimeouts.delete(key);
+      bot.sendMessage(
+        chatId,
+        `⌛ Proses "${getProcessLabel(state)}" otomatis dibatalkan karena terlalu lama tidak selesai. Silakan mulai lagi.`
+      ).catch(() => {});
+    }
+  }, timeoutMs);
+
+  processTimeouts.set(key, timeout);
+}
+
+async function rejectIfBusy(chatId, processName) {
+  const existing = userManager.getUserState(chatId);
+  if (!existing?.processLocked) return false;
+
+  await bot.sendMessage(
+    chatId,
+    `⏳ Tidak bisa memulai ${processName} karena proses "${getProcessLabel(existing)}" masih berjalan.\n\n` +
+    'Tunggu sampai selesai, atau ketik /cancel untuk membatalkan proses yang aktif.'
+  );
+  return true;
+}
+
+
+function assertProcessActive(chatId, expectedProcessName = null) {
+  const state = userManager.getUserState(chatId);
+  const isActive = Boolean(state?.processLocked) && (!expectedProcessName || state.processName === expectedProcessName);
+  if (!isActive) {
+    const error = new Error('Proses sudah dibatalkan atau kedaluwarsa.');
+    error.code = 'PROCESS_CANCELLED';
+    throw error;
+  }
+  return state;
+}
+
+
+
+// Command /cancel - membatalkan proses multi-step aktif milik user
+bot.onText(/\/cancel/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  if (!hasAccess(msg)) {
+    bot.sendMessage(chatId, '⛔ Maaf, Anda tidak memiliki akses ke bot ini.');
+    return;
+  }
+
+  const state = userManager.getUserState(chatId);
+  if (!state?.processLocked) {
+    bot.sendMessage(chatId, 'ℹ️ Tidak ada proses aktif yang perlu dibatalkan.');
+    return;
+  }
+
+  const processName = getProcessLabel(state);
+  finishUserProcess(chatId);
+  bot.sendMessage(chatId, `❌ Proses "${processName}" dibatalkan. Anda bisa memulai proses baru sekarang.`);
+});
 
 // Command /getid - dapat diakses semua orang
 bot.onText(/\/getid/, (msg) => {
@@ -295,25 +465,19 @@ bot.onText(/\/listusers/, async (msg) => {
 // Fungsi untuk mengecek ukuran folder user
 async function getUserStorageInfo(userFolder) {
   try {
-    // Buat folder jika belum ada
     await fsPromises.mkdir(userFolder, { recursive: true });
-
-    // Baca isi folder
     const files = await fsPromises.readdir(userFolder);
-    // const txtFiles = files.filter(file => file.endsWith('.txt') || file.endsWith('.vcf'));
-    const txtFiles = files.filter(file => file.endsWith('.txt'));
-
-    // Hitung total ukuran
-    let totalSize = 0;
-    for (const file of txtFiles) {
-      const filePath = path.join(userFolder, file);
-      const stats = await fsPromises.stat(filePath);
-      totalSize += stats.size;
-    }
+    const managedFiles = files.filter(file => ALLOWED_FILE_EXTENSIONS.includes(path.extname(file).toLowerCase()));
+    const sizes = await Promise.all(
+      managedFiles.map(async (file) => {
+        const stats = await fsPromises.stat(path.join(userFolder, file));
+        return stats.size;
+      })
+    );
 
     return {
-      fileCount: txtFiles.length,
-      totalSize
+      fileCount: managedFiles.length,
+      totalSize: sizes.reduce((total, size) => total + size, 0)
     };
   } catch (error) {
     console.error('Error getting storage info:', error);
@@ -359,6 +523,8 @@ bot.onText(/\/createtxt ([\w-]+) (.+)/, async (msg, match) => {
     return;
   }
 
+  if (!(await startUserProcess(chatId, 'membuat file TXT', { action: 'create_txt' }))) return;
+
   const fileName = sanitize(match[1]); // Nama file dari user (parameter pertama)
   const content = match[2]; // Konten file (parameter kedua)
   const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
@@ -395,19 +561,22 @@ bot.onText(/\/createtxt ([\w-]+) (.+)/, async (msg, match) => {
 
     bot.sendMessage(chatId, `✅ File berhasil dibuat!\n\n📝 Nama: ${fileName}.txt\n💾 Lokasi: /userfiles/${chatId}/${fileName}.txt`);
 
-    // Kirim file ke user
-    async function sendFile(chatId, filePath, caption) {
-      return bot.sendDocument(chatId, fs.createReadStream(filePath), {
-        filename: path.basename(filePath),
-        caption: caption,
-        contentType: path.extname(filePath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain'
-      });
+    // Kirim file ke user dengan retry 3x
+    try {
+      await sendFile(chatId, filePath, `📝 File txt Anda: ${fileName}.txt`);
+    } catch (sendError) {
+      console.error('Error sending created TXT file:', sendError);
+      await bot.sendMessage(
+        chatId,
+        `⚠️ File ${fileName}.txt sudah dibuat dan tersimpan, tetapi gagal dikirim setelah ${SEND_FILE_MAX_RETRIES}x percobaan. Gunakan /getfile ${fileName} untuk mengambil ulang.`
+      );
     }
-    await sendFile(chatId, filePath, `📝 File txt Anda: ${fileName}.txt`);
 
   } catch (error) {
     console.error('Error creating file:', error);
     bot.sendMessage(chatId, '❌ Gagal membuat file: ' + error.message);
+  } finally {
+    finishUserProcess(chatId);
   }
 });
 
@@ -485,30 +654,23 @@ bot.onText(/\/getfile (.+)/, async (msg, match) => {
     return;
   }
 
-  const txtFileName = sanitize(match[1]);
-  const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
-  const inputPath = path.join(userFolder, `${txtFileName}.txt`);
+  const requestedName = sanitize(path.parse(match[1]).name);
+  const requestedExt = path.extname(match[1]).toLowerCase();
+  const userFolder = getUserFolder(chatId);
+  const candidates = requestedExt
+    ? [path.join(userFolder, `${requestedName}${requestedExt}`)]
+    : [path.join(userFolder, `${requestedName}.txt`), path.join(userFolder, `${requestedName}.vcf`)];
 
   try {
-    // Cek apakah file txt ada
-    await new Promise((resolve, reject) => {
-      fs.access(inputPath, fs.constants.F_OK, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-
-
-    bot.sendDocument(chatId, fs.createReadStream(inputPath), {
-      filename: path.basename(inputPath),
-      contentType: path.extname(inputPath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain',
-      caption: '',
-    });
-
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      bot.sendMessage(chatId, `❌ File ${txtFileName}.txt tidak ditemukan.`);
+    const inputPath = candidates.find(filePath => fs.existsSync(filePath));
+    if (!inputPath) {
+      bot.sendMessage(chatId, `❌ File ${requestedName}.txt atau ${requestedName}.vcf tidak ditemukan.`);
+      return;
     }
+
+    await sendFile(chatId, inputPath, '');
+  } catch (error) {
+    bot.sendMessage(chatId, '❌ Gagal mengambil file: ' + error.message);
   }
 });
 
@@ -535,10 +697,15 @@ bot.onText(/\/active/, async (msg) => {
   bot.sendMessage(msg.chat.id, message);
 });
 
-// Handle file upload
+// Handle file upload umum (.txt/.vcf) dengan lock per user
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const file = msg.document;
+  const currentState = userManager.getUserState(chatId);
+
+  // File yang dikirim sebagai reply untuk flow tertentu akan diproses oleh handler flow tersebut.
+  // Upload merge VCF juga memiliki handler khusus di bawah.
+  if (msg.reply_to_message || currentState?.action === 'merge_upload_files') return;
 
   // Cek akses user
   if (!userManager.hasUser(chatId) && !isOwner(msg)) {
@@ -546,23 +713,26 @@ bot.on('document', async (msg) => {
     return;
   }
 
-  const allowedExtensions = ['.txt', '.vcf'];
   const fileExt = path.extname(file.file_name).toLowerCase();
-  if (!allowedExtensions.includes(fileExt)) {
+  if (!ALLOWED_FILE_EXTENSIONS.includes(fileExt)) {
     bot.sendMessage(chatId, '⚠️ Hanya file .txt dan .vcf yang diperbolehkan!');
     return;
   }
 
-  try {
-    const fileInfo = await bot.getFile(file.file_id);
-    const fileName = sanitize(file.file_name);
-    const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
-    const filePath = path.join(userFolder, fileName);
+  if (!(await startUserProcess(chatId, 'upload file', { action: 'upload_file' }))) return;
 
-    // Cek apakah file sudah ada
-    try {
-      await fsPromises.access(filePath);
-      // File exists, ask for confirmation
+  try {
+    const userFolder = getUserFolder(chatId);
+    await fsPromises.mkdir(userFolder, { recursive: true });
+
+    let fileName = sanitize(file.file_name);
+    let filePath = path.join(userFolder, fileName);
+    let alreadyExists = await fileExists(filePath);
+    let oldSize = alreadyExists ? (await fsPromises.stat(filePath)).size : 0;
+
+    // Jika nama file sudah ada, minta keputusan user tanpa melepas lock.
+    if (alreadyExists) {
+      updateUserProcess(chatId, { action: 'upload_wait_overwrite_choice' });
       const confirmMsg = await bot.sendMessage(
         chatId,
         `⚠️ File dengan nama "${fileName}" sudah ada!\n\nApakah Anda ingin:\n` +
@@ -570,99 +740,82 @@ bot.on('document', async (msg) => {
         '2. Timpa file yang ada\n' +
         '3. Batalkan upload\n\n' +
         'Pilih dengan mengirim nomor (1-3)',
-        {
-          reply_markup: {
-            force_reply: true,
-            selective: true
-          }
-        }
+        { reply_markup: { force_reply: true, selective: true } }
       );
 
       const response = await new Promise(resolve => {
-        bot.onReplyToMessage(chatId, confirmMsg.message_id, async (responseMsg) => {
-          resolve(responseMsg.text);
+        bot.onReplyToMessage(chatId, confirmMsg.message_id, (responseMsg) => {
+          resolve((responseMsg.text || '').trim());
         });
       });
+      assertProcessActive(chatId, 'upload file');
 
-      switch (response) {
-        case '1': // Ganti nama
-          const askNewName = await bot.sendMessage(
-            chatId,
-            '📝 Masukkan nama baru untuk file (tanpa .txt):',
-            {
-              reply_markup: {
-                force_reply: true,
-                selective: true
-              }
-            }
-          );
+      if (response === '1') {
+        updateUserProcess(chatId, { action: 'upload_wait_new_name' });
+        const askNewName = await bot.sendMessage(
+          chatId,
+          `📝 Masukkan nama baru untuk file (tanpa ${fileExt}):`,
+          { reply_markup: { force_reply: true, selective: true } }
+        );
 
-          const newName = await new Promise(resolve => {
-            bot.onReplyToMessage(chatId, askNewName.message_id, async (nameMsg) => {
-              resolve(sanitize(nameMsg.text) + '.txt');
-            });
+        const newName = await new Promise(resolve => {
+          bot.onReplyToMessage(chatId, askNewName.message_id, (nameMsg) => {
+            resolve(`${sanitize(path.parse(nameMsg.text || '').name)}${fileExt}`);
           });
+        });
+        assertProcessActive(chatId, 'upload file');
 
-          filePath = path.join(userFolder, newName);
-          break;
-
-        case '2': // Timpa file
-          // Lanjut dengan path yang sama
-          break;
-
-        case '3': // Batalkan
-          bot.sendMessage(chatId, '❌ Upload dibatalkan.');
+        if (!sanitize(path.parse(newName).name)) {
+          bot.sendMessage(chatId, '❌ Nama file tidak valid. Upload dibatalkan.');
           return;
+        }
 
-        default:
-          bot.sendMessage(chatId, '❌ Pilihan tidak valid. Upload dibatalkan.');
-          return;
+        fileName = newName;
+        filePath = path.join(userFolder, fileName);
+        alreadyExists = await fileExists(filePath);
+        oldSize = alreadyExists ? (await fsPromises.stat(filePath)).size : 0;
+      } else if (response === '2') {
+        // Lanjut timpa file yang ada
+      } else {
+        bot.sendMessage(chatId, '❌ Upload dibatalkan.');
+        return;
       }
-    } catch (err) {
-      // File doesn't exist, continue with upload
     }
+
+    updateUserProcess(chatId, { action: 'upload_check_limit' });
 
     // Cek batasan penyimpanan
     const storage = await getUserStorageInfo(userFolder);
     const limits = userManager.getStorageLimits(chatId);
 
-    // Cek jumlah file
-    if (storage.fileCount >= limits.MAX_FILES_PER_USER) {
+    if (!alreadyExists && storage.fileCount >= limits.MAX_FILES_PER_USER) {
       bot.sendMessage(chatId, '⚠️ Batas maksimal jumlah file tercapai!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
       return;
     }
 
-    // Cek ukuran file
     if (file.file_size > limits.MAX_FILE_SIZE) {
       bot.sendMessage(chatId, `⚠️ Ukuran file terlalu besar!\n\nMaksimal: ${formatBytes(limits.MAX_FILE_SIZE)}\nUkuran file: ${formatBytes(file.file_size)}`);
       return;
     }
 
-    // Cek total ukuran
-    if (storage.totalSize + file.file_size > limits.MAX_TOTAL_SIZE) {
+    if (storage.totalSize - oldSize + file.file_size > limits.MAX_TOTAL_SIZE) {
       bot.sendMessage(chatId, '⚠️ Total ukuran penyimpanan akan melebihi batas!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
       return;
     }
 
-    // Buat folder jika belum ada
-    await fsPromises.mkdir(userFolder, { recursive: true });
-
-    // Download dan simpan file
-    const fileStream = await bot.getFileStream(file.file_id);
-    const writeStream = fs.createWriteStream(filePath);
-
-    await new Promise((resolve, reject) => {
-      fileStream.pipe(writeStream)
-        .on('finish', resolve)
-        .on('error', reject);
-    });
+    updateUserProcess(chatId, { action: 'upload_downloading' });
+    await downloadTelegramFile(file.file_id, filePath);
 
     const finalFileName = path.basename(filePath);
     bot.sendMessage(chatId, `✅ File berhasil diunggah!\n\n📝 Nama: ${finalFileName}\n💾 Lokasi: /userfiles/${chatId}/${finalFileName}\n\nGunakan command /txt2vcf ${path.parse(finalFileName).name} untuk mengkonversi ke VCF`);
 
   } catch (error) {
-    console.error('Error uploading file:', error);
-    bot.sendMessage(chatId, '❌ Gagal mengunggah file: ' + error.message);
+    if (error.code !== 'PROCESS_CANCELLED') {
+      console.error('Error uploading file:', error);
+      bot.sendMessage(chatId, '❌ Gagal mengunggah file: ' + error.message);
+    }
+  } finally {
+    finishUserProcess(chatId);
   }
 });
 
@@ -680,6 +833,9 @@ bot.on('message', (msg) => {
       bot.sendMessage(chatId, '⛔ Maaf, Anda tidak memiliki akses ke bot ini.\nHubungi owner untuk mendapatkan akses.');
       return;
     }
+
+    // Jangan balas generik saat user sedang menjalankan proses multi-step.
+    if (userManager.getUserState(chatId)) return;
 
     if (isOwner(msg)) {
       bot.sendMessage(chatId, 'Hai Owner! 👑');
@@ -735,91 +891,108 @@ process.on('SIGINT', handleShutdown);
 process.on('SIGTERM', handleShutdown);
 
 // Command /txt2vcf - konversi file txt ke vcf
-bot.onText(/\/txt2vcf/, async (msg) => {
+bot.onText(/\/txt2vcf(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
 
   // Cek akses user
-  if (!userManager.hasUser(chatId) && !isOwner(msg)) {
+  if (!hasAccess(msg)) {
     bot.sendMessage(chatId, '⛔ Maaf, Anda tidak memiliki akses ke bot ini.');
     return;
   }
 
-  // Minta user untuk upload file
-  const uploadMsg = await bot.sendMessage(
-    chatId,
-    '📤 Silakan kirim file .txt yang ingin dikonversi ke VCF',
-    {
-      reply_markup: {
-        force_reply: true,
-        selective: true
-      }
-    }
-  );
+  if (!(await startUserProcess(chatId, 'konversi TXT ke VCF', { action: 'txt2vcf_start' }))) return;
 
-  // Tunggu user mengirim file
-  bot.onReplyToMessage(chatId, uploadMsg.message_id, async (fileMsg) => {
-    if (!fileMsg.document) {
-      bot.sendMessage(chatId, '⚠️ Mohon kirim file dalam format dokumen!');
-      return;
-    }
+  const userFolder = getUserFolder(chatId);
+  const requestedName = match?.[1] ? sanitize(path.parse(match[1]).name) : null;
 
-    const file = fileMsg.document;
+  // Mode cepat: /txt2vcf nama_file yang sudah tersimpan
+  if (requestedName) {
+    await processConversion(chatId, requestedName, userFolder);
+    return;
+  }
 
-    // Cek tipe file
-    if (!file.file_name.toLowerCase().endsWith('.txt')) {
-      bot.sendMessage(chatId, '⚠️ Hanya file .txt yang diperbolehkan!');
-      return;
-    }
+  try {
+    updateUserProcess(chatId, { action: 'txt2vcf_wait_upload' });
 
-    try {
-      const fileInfo = await bot.getFile(file.file_id);
-      const fileName = sanitize(file.file_name);
-      const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
-      let filePath = path.join(userFolder, fileName);
+    // Minta user untuk upload file
+    const uploadMsg = await bot.sendMessage(
+      chatId,
+      '📤 Silakan kirim file .txt yang ingin dikonversi ke VCF\n\nAtau gunakan: /txt2vcf nama_file jika file sudah ada di /myfiles',
+      { reply_markup: { force_reply: true, selective: true } }
+    );
 
-      // Cek batasan penyimpanan
-      const storage = await getUserStorageInfo(userFolder);
-      const limits = userManager.getStorageLimits(chatId);
-
-      // Cek jumlah file
-      if (storage.fileCount >= limits.MAX_FILES_PER_USER) {
-        bot.sendMessage(chatId, '⚠️ Batas maksimal jumlah file tercapai!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
+    // Tunggu user mengirim file
+    bot.onReplyToMessage(chatId, uploadMsg.message_id, async (fileMsg) => {
+      try {
+        assertProcessActive(chatId, 'konversi TXT ke VCF');
+      } catch {
         return;
       }
 
-      // Cek ukuran file
-      if (file.file_size > limits.MAX_FILE_SIZE) {
-        bot.sendMessage(chatId, `⚠️ Ukuran file terlalu besar!\n\nMaksimal: ${formatBytes(limits.MAX_FILE_SIZE)}\nUkuran file: ${formatBytes(file.file_size)}`);
+      if (!fileMsg.document) {
+        bot.sendMessage(chatId, '⚠️ Mohon kirim file dalam format dokumen!');
+        finishUserProcess(chatId);
         return;
       }
 
-      // Cek total ukuran
-      if (storage.totalSize + file.file_size > limits.MAX_TOTAL_SIZE) {
-        bot.sendMessage(chatId, '⚠️ Total ukuran penyimpanan akan melebihi batas!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
+      const file = fileMsg.document;
+
+      // Cek tipe file
+      if (!file.file_name.toLowerCase().endsWith('.txt')) {
+        bot.sendMessage(chatId, '⚠️ Hanya file .txt yang diperbolehkan!');
+        finishUserProcess(chatId);
         return;
       }
-      // Buat folder user jika belum ada
-      await fsPromises.mkdir(userFolder, { recursive: true });
 
-      // Download dan simpan file
-      const fileStream = await bot.getFileStream(file.file_id);
-      const writeStream = fs.createWriteStream(filePath);
+      try {
+        updateUserProcess(chatId, { action: 'txt2vcf_download_input' });
+        await fsPromises.mkdir(userFolder, { recursive: true });
 
-      await new Promise((resolve, reject) => {
-        fileStream.pipe(writeStream)
-          .on('finish', resolve)
-          .on('error', reject);
-      });
+        const fileName = sanitize(file.file_name);
+        const filePath = path.join(userFolder, fileName);
 
-      const txtFileName = path.parse(fileName).name;
-      // Langsung lanjut ke proses konversi
-      await processConversion(chatId, txtFileName, userFolder);
+        // Cek batasan penyimpanan
+        const storage = await getUserStorageInfo(userFolder);
+        const limits = userManager.getStorageLimits(chatId);
+        const alreadyExists = await fileExists(filePath);
+        const oldSize = alreadyExists ? (await fsPromises.stat(filePath)).size : 0;
 
-    } catch (error) {
-      console.error('Error uploading file:', error);
-      bot.sendMessage(chatId, '❌ Gagal mengunggah file: ' + error.message);
-    }
-  });
+        if (!alreadyExists && storage.fileCount >= limits.MAX_FILES_PER_USER) {
+          bot.sendMessage(chatId, '⚠️ Batas maksimal jumlah file tercapai!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
+          finishUserProcess(chatId);
+          return;
+        }
+
+        if (file.file_size > limits.MAX_FILE_SIZE) {
+          bot.sendMessage(chatId, `⚠️ Ukuran file terlalu besar!\n\nMaksimal: ${formatBytes(limits.MAX_FILE_SIZE)}\nUkuran file: ${formatBytes(file.file_size)}`);
+          finishUserProcess(chatId);
+          return;
+        }
+
+        if (storage.totalSize - oldSize + file.file_size > limits.MAX_TOTAL_SIZE) {
+          bot.sendMessage(chatId, '⚠️ Total ukuran penyimpanan akan melebihi batas!\n\nHapus beberapa file lama menggunakan /deletefile untuk mengunggah file baru.');
+          finishUserProcess(chatId);
+          return;
+        }
+
+        await downloadTelegramFile(file.file_id, filePath);
+
+        const txtFileName = path.parse(fileName).name;
+        await processConversion(chatId, txtFileName, userFolder);
+
+      } catch (error) {
+        if (error.code !== 'PROCESS_CANCELLED') {
+          console.error('Error uploading file:', error);
+          bot.sendMessage(chatId, '❌ Gagal mengunggah file: ' + error.message);
+        }
+        finishUserProcess(chatId);
+      }
+    });
+  } catch (error) {
+    console.error('Error starting txt2vcf:', error);
+    bot.sendMessage(chatId, '❌ Gagal memulai konversi: ' + error.message);
+    finishUserProcess(chatId);
+  }
 });
 
 // Fungsi untuk memproses konversi txt ke vcf
@@ -827,6 +1000,8 @@ async function processConversion(chatId, txtFileName, userFolder) {
   const inputPath = path.join(userFolder, `${txtFileName}.txt`);
 
   try {
+    updateUserProcess(chatId, { action: 'txt2vcf_validate_input' });
+
     // Cek apakah file txt ada
     try {
       await fsPromises.access(inputPath, fs.constants.F_OK);
@@ -861,6 +1036,8 @@ async function processConversion(chatId, txtFileName, userFolder) {
       return;
     }
 
+    updateUserProcess(chatId, { action: 'txt2vcf_wait_contact_name' });
+
     // Tanya nama kontak
     const askName = await bot.sendMessage(chatId,
       '📝 Masukkan nama untuk kontak ini:\n' +
@@ -876,6 +1053,9 @@ async function processConversion(chatId, txtFileName, userFolder) {
         resolve(nameMsg.text);
       });
     });
+    assertProcessActive(chatId, 'konversi TXT ke VCF');
+
+    updateUserProcess(chatId, { action: 'txt2vcf_wait_start_number' });
 
     // Tanya nomor urut awal
     const askStartNumber = await bot.sendMessage(chatId,
@@ -893,6 +1073,9 @@ async function processConversion(chatId, txtFileName, userFolder) {
         resolve(isNaN(num) ? 1 : num);
       });
     });
+    assertProcessActive(chatId, 'konversi TXT ke VCF');
+
+    updateUserProcess(chatId, { action: 'txt2vcf_wait_vcf_name' });
 
     // Tanya nama file VCF
     const defaultVcfName = txtFileName.replace(/[-_\s]+/g, '_').toLowerCase();
@@ -912,6 +1095,9 @@ async function processConversion(chatId, txtFileName, userFolder) {
         resolve(name === '.' ? defaultVcfName : sanitize(name));
       });
     });
+    assertProcessActive(chatId, 'konversi TXT ke VCF');
+
+    updateUserProcess(chatId, { action: 'txt2vcf_wait_file_number' });
 
     // Tanya nomor urut file
     const askFileNumber = await bot.sendMessage(chatId,
@@ -931,6 +1117,9 @@ async function processConversion(chatId, txtFileName, userFolder) {
         resolve(isNaN(num) ? 1 : num);
       });
     });
+    assertProcessActive(chatId, 'konversi TXT ke VCF');
+
+    updateUserProcess(chatId, { action: 'txt2vcf_wait_split_count' });
 
     // Tanya jumlah file
     const totalContacts = cleanContent.split('\n').length;
@@ -954,6 +1143,9 @@ async function processConversion(chatId, txtFileName, userFolder) {
         resolve(isNaN(num) ? 0 : num);
       });
     });
+    assertProcessActive(chatId, 'konversi TXT ke VCF');
+
+    updateUserProcess(chatId, { action: 'txt2vcf_converting' });
 
     // Konversi ke vcf dengan nama dan nomor urut yang diberikan
     const result = await vcfConverter.convertTxtToVcf(inputPath, {
@@ -963,13 +1155,53 @@ async function processConversion(chatId, txtFileName, userFolder) {
       fileStartNumber: fileStartNumber
     });
 
-    // Simpan file-file vcf
-    const outputPaths = [];
+    updateUserProcess(chatId, { action: 'txt2vcf_saving_output' });
+
+    // Siapkan output dan cek limit storage sebelum file ditulis
+    const outputItems = [];
     for (let i = 0; i < result.contents.length; i++) {
       const suffix = result.fileCount > 1 ? ` ${i + fileStartNumber}` : '';
       const outputPath = path.join(userFolder, `${vcfFileName}${suffix}.vcf`);
-      await fsPromises.writeFile(outputPath, result.contents[i], 'utf8');
-      outputPaths.push(outputPath);
+      outputItems.push({
+        outputPath,
+        content: result.contents[i],
+        size: Buffer.byteLength(result.contents[i], 'utf8')
+      });
+    }
+
+    const storageBeforeOutput = await getUserStorageInfo(userFolder);
+    const limits = userManager.getStorageLimits(chatId);
+    let replacedSize = 0;
+    let newFileCount = 0;
+
+    for (const item of outputItems) {
+      const exists = await fileExists(item.outputPath);
+      if (exists) {
+        replacedSize += (await fsPromises.stat(item.outputPath)).size;
+      } else {
+        newFileCount++;
+      }
+
+      if (item.size > limits.MAX_FILE_SIZE) {
+        throw new Error(`File hasil VCF terlalu besar: ${path.basename(item.outputPath)} (${formatBytes(item.size)}). Maksimal ${formatBytes(limits.MAX_FILE_SIZE)}.`);
+      }
+    }
+
+    const totalOutputSize = outputItems.reduce((sum, item) => sum + item.size, 0);
+
+    if (storageBeforeOutput.fileCount + newFileCount > limits.MAX_FILES_PER_USER) {
+      throw new Error('Jumlah file hasil konversi akan melewati batas. Kurangi jumlah split atau hapus file lama dengan /clean.');
+    }
+
+    if (storageBeforeOutput.totalSize - replacedSize + totalOutputSize > limits.MAX_TOTAL_SIZE) {
+      throw new Error('Total storage akan melewati batas setelah konversi. Hapus file lama dulu dengan /clean atau kecilkan hasil split.');
+    }
+
+    // Simpan file-file vcf
+    const outputPaths = [];
+    for (const item of outputItems) {
+      await fsPromises.writeFile(item.outputPath, item.content, 'utf8');
+      outputPaths.push(item.outputPath);
     }
 
     // Hitung total nomor
@@ -1002,26 +1234,29 @@ async function processConversion(chatId, txtFileName, userFolder) {
       `🌍 Ditemukan ${totalCountries} negara:\n${countrySummary}\n\n` +
       `📄 Hasil: ${vcfFileName}`);
 
-    // Kirim semua file vcf
-    for (let i = 0; i < outputPaths.length; i++) {
-      try {
-        const suffix = result.fileCount > 1 ? ` (${i + 1}/${result.fileCount})` : '';
+    updateUserProcess(chatId, { action: 'txt2vcf_sending_output' });
+
+    const failedFiles = await sendFilesSequentially(
+      chatId,
+      outputPaths.map((filePath, index) => {
+        const suffix = result.fileCount > 1 ? ` (${index + 1}/${result.fileCount})` : '';
         const contactsInFile = Math.ceil(result.count / result.fileCount);
-        async function sendFile(chatId, filePath, caption) {
-          return bot.sendDocument(chatId, fs.createReadStream(filePath), {
-            filename: path.basename(filePath),
-            contentType: path.extname(filePath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain',
-            caption: caption
-          });
-        }
-        await sendFile(chatId, outputPaths[i],);
-        // await sendFile(chatId, outputPaths[i],
-        //   `ℹ️ Berisi ${contactsInFile} kontak ${suffix}\n`
-        // );
-      } catch (error) {
-        console.error(`Error sending file ${i + 1}:`, error);
-        bot.sendMessage(chatId, `❌ Gagal mengirim file ${i + 1}: ${error.message}`);
-      }
+        return {
+          filePath,
+          caption: `ℹ️ Berisi sekitar ${contactsInFile} kontak${suffix}`
+        };
+      })
+    );
+
+    if (failedFiles.length > 0) {
+      await bot.sendMessage(
+        chatId,
+        `⚠️ Konversi sudah selesai dan file sudah tersimpan, tetapi ada ${failedFiles.length} file yang tetap gagal dikirim setelah ${SEND_FILE_MAX_RETRIES}x percobaan:
+
+` +
+        failedFiles.map(item => `- ${path.basename(item.filePath)}: ${item.error}`).join('\n') +
+        '\n\nGunakan /getfile nama_file untuk mengambil ulang file yang gagal, tanpa mengulang convert dari awal.'
+      );
     }
 
   } catch (error) {
@@ -1031,21 +1266,58 @@ async function processConversion(chatId, txtFileName, userFolder) {
       console.error('Error converting to vcf:', error);
       bot.sendMessage(chatId, '❌ Gagal mengkonversi file: ' + error.message);
     }
+  } finally {
+    finishUserProcess(chatId);
   }
 }
 
-// Fungsi untuk mengirim file ke user
+// Fungsi untuk mengirim file ke user dengan retry 3x.
+// Kalau gagal setelah retry, proses utama tidak diulang dari awal.
 async function sendFile(chatId, filePath, caption = '') {
-  try {
-    await bot.sendDocument(chatId, fs.createReadStream(filePath), {
-      filename: path.basename(filePath),
-      caption: caption,
-      contentType: path.extname(filePath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain'
-    });
-  } catch (error) {
-    console.error('Error sending file:', error);
-    throw new Error('Gagal mengirim file: ' + error.message);
+  let lastError;
+
+  for (let attempt = 1; attempt <= SEND_FILE_MAX_RETRIES; attempt++) {
+    try {
+      await bot.sendDocument(chatId, fs.createReadStream(filePath), {
+        filename: path.basename(filePath),
+        caption,
+        contentType: path.extname(filePath).toLowerCase() === '.vcf' ? 'text/vcard' : 'text/plain'
+      });
+      return { ok: true, attempts: attempt };
+    } catch (error) {
+      lastError = error;
+      console.error(`Error sending file ${path.basename(filePath)} attempt ${attempt}/${SEND_FILE_MAX_RETRIES}:`, error.message);
+
+      if (attempt < SEND_FILE_MAX_RETRIES) {
+        await sleep(SEND_FILE_RETRY_DELAY_MS);
+      }
+    }
   }
+
+  throw new Error(`Gagal mengirim file setelah ${SEND_FILE_MAX_RETRIES}x percobaan: ${lastError?.message || 'Unknown error'}`);
+}
+
+async function sendFilesSequentially(chatId, files) {
+  const failedFiles = [];
+
+  for (let i = 0; i < files.length; i++) {
+    const item = typeof files[i] === 'string' ? { filePath: files[i], caption: '' } : files[i];
+
+    try {
+      await sendFile(chatId, item.filePath, item.caption || '');
+    } catch (error) {
+      failedFiles.push({
+        filePath: item.filePath,
+        error: error.message
+      });
+    }
+
+    if (i < files.length - 1) {
+      await sleep(SEND_FILE_DELAY_BETWEEN_FILES_MS);
+    }
+  }
+
+  return failedFiles;
 }
 
 // Command /merge2vcf - merge multiple VCF files with custom name
@@ -1058,19 +1330,17 @@ bot.onText(/\/mergevcf(?:\s+(.+))?/, async (msg, match) => {
     return;
   }
 
-  const userFolder = path.join(process.cwd(), 'users', chatId.toString());
 
   try {
     // Parse custom name from command
     const customName = match[1] ? sanitize(match[1]) : 'merged';
     const outputFileName = `${customName}.vcf`;
 
-    // Store initial user state
-    userManager.setUserState(chatId, {
+    if (!(await startUserProcess(chatId, 'merge VCF', {
       action: 'merge_choose_method',
       outputName: outputFileName,
-      selectedFiles: [] // Array untuk menyimpan file yang dipilih
-    });
+      selectedFiles: []
+    }))) return;
 
     // Ask user to choose method
     bot.sendMessage(chatId, 
@@ -1092,6 +1362,7 @@ bot.onText(/\/mergevcf(?:\s+(.+))?/, async (msg, match) => {
   } catch (error) {
     console.error('Error in merge command:', error);
     bot.sendMessage(chatId, '❌ Terjadi kesalahan: ' + error.message);
+    finishUserProcess(chatId);
   }
 });
 
@@ -1132,7 +1403,7 @@ bot.on('text', async (msg) => {
       await bot.sendMessage(chatId, '⏳ Sedang menggabungkan file...');
       await mergeSelectedFiles(chatId, state.selectedFiles, state.outputName);
     } else if (text === 'batal') {
-      userManager.clearUserState(chatId);
+      finishUserProcess(chatId);
       await bot.sendMessage(chatId, '❌ Penggabungan file dibatalkan');
     }
     return;
@@ -1142,7 +1413,7 @@ bot.on('text', async (msg) => {
   if (state.action !== 'merge_select_numbers') return;
   
   if (text === '/cancel') {
-    userManager.clearUserState(chatId);
+    finishUserProcess(chatId);
     await bot.sendMessage(chatId, '❌ Penggabungan file dibatalkan');
     return;
   }
@@ -1213,7 +1484,8 @@ bot.on('text', async (msg) => {
 // Helper function to merge selected files
 async function mergeSelectedFiles(chatId, files, outputName) {
   try {
-    const userFolder = path.join(process.cwd(), 'userfiles', chatId.toString());
+    updateUserProcess(chatId, { action: 'merge_processing' });
+    const userFolder = getUserFolder(chatId);
     
     // Get full paths of all files
     const filePaths = files.map(file => path.join(userFolder, file));
@@ -1221,12 +1493,27 @@ async function mergeSelectedFiles(chatId, files, outputName) {
     // Merge files and get stats
     const result = await vcfConverter.mergeVcfFiles(filePaths, outputName);
     
-    // Save merged file
+    // Save merged file setelah cek storage
     const outputPath = path.join(userFolder, outputName);
+    const storage = await getUserStorageInfo(userFolder);
+    const limits = userManager.getStorageLimits(chatId);
+    const outputExists = await fileExists(outputPath);
+    const oldSize = outputExists ? (await fsPromises.stat(outputPath)).size : 0;
+    const outputSize = Buffer.byteLength(result.content, 'utf8');
+
+    if (!outputExists && storage.fileCount >= limits.MAX_FILES_PER_USER) {
+      throw new Error('Batas maksimal jumlah file tercapai. Hapus file lama dulu dengan /deletefile atau /clean.');
+    }
+
+    if (outputSize > limits.MAX_FILE_SIZE) {
+      throw new Error(`Ukuran file hasil merge terlalu besar. Maksimal ${formatBytes(limits.MAX_FILE_SIZE)}, hasil ${formatBytes(outputSize)}.`);
+    }
+
+    if (storage.totalSize - oldSize + outputSize > limits.MAX_TOTAL_SIZE) {
+      throw new Error('Total storage akan melewati batas setelah merge. Hapus file lama dulu dengan /deletefile atau /clean.');
+    }
+
     await fsPromises.writeFile(outputPath, result.content);
-    
-    // Clear user state
-    userManager.clearUserState(chatId);
     
     // Format country stats
     const countryStats = Object.entries(result.stats.countries)
@@ -1242,12 +1529,21 @@ async function mergeSelectedFiles(chatId, files, outputName) {
       `📄 Hasil: ${outputName}`;
     
     await bot.sendMessage(chatId, message);
-    await sendFile(chatId, outputPath, `📁 File VCF hasil penggabungan`);
+    try {
+      await sendFile(chatId, outputPath, `📁 File VCF hasil penggabungan`);
+    } catch (sendError) {
+      console.error('Error sending merged VCF file:', sendError);
+      await bot.sendMessage(
+        chatId,
+        `⚠️ File merge ${outputName} sudah berhasil dibuat dan tersimpan, tetapi gagal dikirim setelah ${SEND_FILE_MAX_RETRIES}x percobaan. Gunakan /getfile ${path.parse(outputName).name} untuk mengambil ulang.`
+      );
+    }
+    finishUserProcess(chatId);
     
   } catch (error) {
     console.error('Error merging files:', error);
     bot.sendMessage(chatId, '❌ Gagal menggabungkan file: ' + error.message);
-    userManager.clearUserState(chatId);
+    finishUserProcess(chatId);
   }
 }
 
@@ -1322,9 +1618,15 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
     return;
   }
 
-  const userFolder = path.join(__dirname, 'userfiles', chatId.toString());
+  const mode = match?.[1]?.toLowerCase();
+
+  if (await rejectIfBusy(chatId, mode ? 'pembersihan storage' : 'menu clean')) return;
+
+  const userFolder = getUserFolder(chatId);
 
   try {
+    await fsPromises.mkdir(userFolder, { recursive: true });
+
     // Baca daftar file
     const files = await fsPromises.readdir(userFolder);
     const txtFiles = files.filter(file => file.toLowerCase().endsWith('.txt'));
@@ -1334,9 +1636,6 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
       bot.sendMessage(chatId, 'ℹ️ Tidak ada file yang perlu dibersihkan.');
       return;
     }
-
-    // Jika ada parameter, itu adalah mode pembersihan
-    const mode = match?.[1]?.toLowerCase();
 
     if (!mode) {
       // Tampilkan menu opsi pembersihan
@@ -1353,6 +1652,8 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
       return;
     }
 
+    if (!(await startUserProcess(chatId, 'pembersihan storage', { action: 'clean_prepare', mode }))) return;
+
     let filesToDelete = [];
 
     switch (mode) {
@@ -1365,101 +1666,133 @@ bot.onText(/\/clean(?:\s+(.+))?/, async (msg, match) => {
       case 'all':
         filesToDelete = [...txtFiles, ...vcfFiles];
         break;
-      case 'old':
-        const now = Date.now();
-        const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
-
-        filesToDelete = files.filter(file => {
-          if (!file.toLowerCase().endsWith('.txt') && !file.toLowerCase().endsWith('.vcf')) {
-            return false;
-          }
-          const stats = fs.statSync(path.join(userFolder, file));
-          return stats.mtimeMs < sevenDaysAgo;
-        });
+      case 'old': {
+        const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+        for (const file of files) {
+          if (!file.toLowerCase().endsWith('.txt') && !file.toLowerCase().endsWith('.vcf')) continue;
+          const stats = await fsPromises.stat(path.join(userFolder, file));
+          if (stats.mtimeMs < sevenDaysAgo) filesToDelete.push(file);
+        }
         break;
+      }
       default:
         bot.sendMessage(chatId, '❌ Mode pembersihan tidak valid. Gunakan /clean untuk melihat opsi yang tersedia.');
+        finishUserProcess(chatId);
         return;
     }
 
     if (filesToDelete.length === 0) {
       bot.sendMessage(chatId, 'ℹ️ Tidak ada file yang perlu dibersihkan untuk mode ini.');
+      finishUserProcess(chatId);
       return;
     }
 
     // Konfirmasi penghapusan
-    const totalSize = filesToDelete.reduce((acc, file) => {
-      const stats = fs.statSync(path.join(userFolder, file));
-      return acc + stats.size;
-    }, 0);
+    let totalSize = 0;
+    const details = [];
+    for (const [i, file] of filesToDelete.entries()) {
+      const stats = await fsPromises.stat(path.join(userFolder, file));
+      totalSize += stats.size;
+      if (i < 20) details.push(`${i + 1}. ${file} (${formatBytes(stats.size)})`);
+    }
 
-    const fileDetails = filesToDelete.map((file, i) => {
-      const stats = fs.statSync(path.join(userFolder, file));
-      const size = formatBytes(stats.size);
-      return `${i + 1}. ${file} (${size})`;
-    }).join('\n');
+    const moreFiles = filesToDelete.length > 20
+      ? `\n...dan ${filesToDelete.length - 20} file lainnya`
+      : '';
 
-    const confirmMsg = await bot.sendMessage(
+    const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+    updateUserProcess(chatId, {
+      action: 'clean_confirm',
+      cleanToken: token,
+      filesToDelete,
+      totalSize,
+      userFolder,
+      mode
+    });
+
+    await bot.sendMessage(
       chatId,
       `⚠️ Anda akan menghapus ${filesToDelete.length} file.\n\n` +
-      `File yang akan dihapus:\n` +
-      fileDetails + '\n\n' +
+      `File yang akan dihapus:\n${details.join('\n')}${moreFiles}\n\n` +
       `Total ukuran: ${formatBytes(totalSize)}\n\n` +
-      `Pilih YA untuk menghapus TIDAK untuk membatalkan`,
+      `Klik YA untuk menghapus atau TIDAK untuk membatalkan.`,
       {
         reply_markup: {
-          // force_reply: true,
-          // selective: true
-          inline_keyboard: [
-            [
-              {
-                text: "YA",
-                callback_data: "btn_yes"
-              },
-              {
-                text: "TIDAK",
-                callback_data: "btn_no"
-              },
-
-            ]
-          ]
+          inline_keyboard: [[
+            { text: 'YA', callback_data: `clean_yes_${token}` },
+            { text: 'TIDAK', callback_data: `clean_no_${token}` }
+          ]]
         }
       }
     );
-
-    const response = await new Promise(resolve => {
-      bot.on('callback_query', async (ctx) => {
-        if (ctx.from.id == chatId) {
-          resolve(ctx.data == 'btn_yes');
-        }
-      })
-    });
-
-    if (!response) {
-      bot.sendMessage(chatId, '❌ Pembersihan dibatalkan.');
-      return;
-    }
-
-    // Hapus file
-    for (const file of filesToDelete) {
-      try {
-        await fsPromises.unlink(path.join(userFolder, file));
-      } catch (err) {
-        console.error(`Failed to delete ${file}:`, err);
-      }
-    }
-
-    const message = `✅ Pembersihan selesai!\n\n` +
-      `📊 Ringkasan:\n` +
-      `• File dihapus: ${filesToDelete.length} file\n` +
-      `• Ukuran dibebaskan: ${formatBytes(totalSize)}\n\n` +
-      `Gunakan /storage untuk melihat penggunaan storage terbaru.`;
-
-    bot.sendMessage(chatId, message);
-
   } catch (error) {
     console.error('Error cleaning storage:', error);
     bot.sendMessage(chatId, '❌ Gagal membersihkan storage: ' + error.message);
+    finishUserProcess(chatId);
+  }
+});
+
+// Callback khusus /clean. Tidak memakai bot.once agar aman saat banyak user klik bersamaan.
+bot.on('callback_query', async (query) => {
+  if (!query.data?.startsWith('clean_')) return;
+
+  const chatId = query.message.chat.id;
+  const state = userManager.getUserState(chatId);
+
+  try {
+    if (!state || state.action !== 'clean_confirm' || !state.processLocked) {
+      await bot.answerCallbackQuery(query.id, { text: 'Konfirmasi clean sudah tidak aktif.' }).catch(() => {});
+      return;
+    }
+
+    const expectedYes = `clean_yes_${state.cleanToken}`;
+    const expectedNo = `clean_no_${state.cleanToken}`;
+
+    if (![expectedYes, expectedNo].includes(query.data)) {
+      await bot.answerCallbackQuery(query.id, { text: 'Tombol konfirmasi sudah kedaluwarsa.' }).catch(() => {});
+      return;
+    }
+
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+
+    if (query.data === expectedNo) {
+      finishUserProcess(chatId);
+      await bot.editMessageText('❌ Pembersihan dibatalkan.', {
+        chat_id: chatId,
+        message_id: query.message.message_id
+      }).catch(() => bot.sendMessage(chatId, '❌ Pembersihan dibatalkan.'));
+      return;
+    }
+
+    updateUserProcess(chatId, { action: 'clean_deleting' });
+
+    let deletedCount = 0;
+    for (const file of state.filesToDelete) {
+      try {
+        await fsPromises.unlink(path.join(state.userFolder, file));
+        deletedCount++;
+      } catch (err) {
+        console.error(`Failed to delete ${file}:`, err.message);
+      }
+    }
+
+    finishUserProcess(chatId);
+
+    const message = `✅ Pembersihan selesai!\n\n` +
+      `📊 Ringkasan:\n` +
+      `• File dihapus: ${deletedCount}/${state.filesToDelete.length} file\n` +
+      `• Ukuran dibebaskan: ${formatBytes(state.totalSize)}\n\n` +
+      `Gunakan /storage untuk melihat penggunaan storage terbaru.`;
+
+    await bot.editMessageText(message, {
+      chat_id: chatId,
+      message_id: query.message.message_id
+    }).catch(() => bot.sendMessage(chatId, message));
+  } catch (error) {
+    console.error('Error handling clean callback:', error);
+    finishUserProcess(chatId);
+    await bot.sendMessage(chatId, '❌ Gagal membersihkan storage: ' + error.message);
   }
 });
 
@@ -1717,39 +2050,6 @@ bot.onText(/\/getlimits/, async (msg) => {
 }
 });
 
-bot.onText(/\/testing/, async (ctx) => {
-  const to = ctx.chat.id
-  const message = await bot.sendMessage(ctx.chat.id, "Please click on button below.", {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "Yes",
-            callback_data: "btn_yes"
-          },
-          {
-            text: "No",
-            callback_data: "btn_no"
-          },
-
-        ]
-      ]
-    }
-  });
-
-  console.log(message)
-
-  bot.on('callback_query', async (query) => {
-    if (query.from.id === to) {
-      if (query.data === "btn_yes") {
-        await bot.sendMessage(query.from.id, "You clicked Yes");
-      } else if (query.data === "btn_no") {
-        await bot.sendMessage(query.from.id, "You clicked No");
-      }
-    }
-  });
-})
-
 // Handle VCF file uploads for merging
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
@@ -1764,22 +2064,36 @@ bot.on('document', async (msg) => {
   }
 
   try {
-    const userFolder = path.join(process.cwd(), 'users', chatId.toString());
-    
-    // Create user directory if it doesn't exist
-    try {
-      await fsPromises.access(userFolder);
-    } catch {
-      await fsPromises.mkdir(userFolder, { recursive: true });
-    }
-    
-    const fileId = file.file_id;
+    const userFolder = getUserFolder(chatId);
+    await fsPromises.mkdir(userFolder, { recursive: true });
     const fileName = sanitize(file.file_name);
     const filePath = path.join(userFolder, fileName);
 
+    const storage = await getUserStorageInfo(userFolder);
+    const limits = userManager.getStorageLimits(chatId);
+    const alreadyExists = await fileExists(filePath);
+    const oldSize = alreadyExists ? (await fsPromises.stat(filePath)).size : 0;
+
+    if (!alreadyExists && storage.fileCount >= limits.MAX_FILES_PER_USER) {
+      bot.sendMessage(chatId, '⚠️ Batas maksimal jumlah file tercapai. Hapus file lama dulu dengan /deletefile atau /clean.');
+      return;
+    }
+
+    if (file.file_size > limits.MAX_FILE_SIZE) {
+      bot.sendMessage(chatId, `⚠️ Ukuran file terlalu besar! Maksimal ${formatBytes(limits.MAX_FILE_SIZE)}, file ini ${formatBytes(file.file_size)}.`);
+      return;
+    }
+
+    if (storage.totalSize - oldSize + file.file_size > limits.MAX_TOTAL_SIZE) {
+      bot.sendMessage(chatId, '⚠️ Total storage akan melewati batas. Hapus file lama dulu dengan /deletefile atau /clean.');
+      return;
+    }
+
+    await downloadTelegramFile(file.file_id, filePath);
+
     // Add file to selected files
     const selectedFiles = userState.selectedFiles || [];
-    selectedFiles.push(fileName);
+    if (!selectedFiles.includes(fileName)) selectedFiles.push(fileName);
     
     // Update state with new file
     userManager.setUserState(chatId, {
@@ -1819,135 +2133,21 @@ bot.onText(/\/done/, async (msg) => {
 });
 
 bot.on('callback_query', async (query) => {
+  const handledMergeCallbacks = ['merge_select_numbers', 'merge_upload', 'merge_done', 'merge_cancel'];
+  if (!handledMergeCallbacks.includes(query.data) && !query.data.startsWith('select_')) return;
+
   const chatId = query.message.chat.id;
   const userState = userManager.getUserState(chatId);
 
-  if (!userState) return;
-
-  const userFolder = path.join(process.cwd(), 'userfiles', chatId.toString());
-
-  if (query.data === 'merge_select') {
-    try {
-      // Create user directory if it doesn't exist
-      try {
-        await fsPromises.access(userFolder);
-      } catch {
-        await fsPromises.mkdir(userFolder, { recursive: true });
-      }
-
-      // Get list of VCF files
-      const files = await fsPromises.readdir(userFolder);
-      const vcfFiles = files.filter(file => file.toLowerCase().endsWith('.vcf'));
-
-      if (vcfFiles.length === 0) {
-        await bot.sendMessage(chatId, '❌ Tidak ada file VCF yang tersedia. Silakan upload file terlebih dahulu.');
-        userManager.clearUserState(chatId);
-        return;
-      }
-
-      // Update state for file selection
-      userManager.setUserState(chatId, {
-        ...userState,
-        action: 'merge_select_files',
-        availableFiles: vcfFiles,
-        selectedFiles: []
-      });
-
-      // Show file selection message with checkboxes
-      await showFileSelectionMessage(chatId, vcfFiles);
-      
-      // Update state with file list
-      userManager.setUserState(chatId, {
-        ...userState,
-        action: 'merge_select_files',
-        availableFiles: vcfFiles,
-        selectedFiles: []
-      });
-
-    } catch (error) {
-      console.error('Error listing files:', error);
-      bot.sendMessage(chatId, '❌ Gagal membaca daftar file');
-      userManager.clearUserState(chatId);
-    }
-  } else if (query.data === 'merge_upload') {
-    // Create user directory if it doesn't exist
-    try {
-      await fsPromises.access(userFolder);
-    } catch {
-      await fsPromises.mkdir(userFolder, { recursive: true });
-    }
-
-    userManager.setUserState(chatId, {
-      ...userState,
-      action: 'merge_upload_files'
-    });
-    
-    bot.sendMessage(chatId, 
-      '📤 Silakan kirim file VCF yang ingin digabungkan.\n' +
-      'Kirim /done jika sudah selesai mengirim semua file.'
-    );
-
-    // Update state with file list
-    userManager.setUserState(chatId, {
-      ...userState,
-      action: 'merge_upload_files',
-      selectedFiles: []
-    });
-    
-  } else if (query.data.startsWith('select_')) {
-    const fileName = query.data.replace('select_', '');
-    const state = userManager.getUserState(chatId);
-    
-    if (state && state.action === 'merge_select_files') {
-      const selectedFiles = state.selectedFiles || [];
-      const fileIndex = selectedFiles.indexOf(fileName);
-      
-      if (fileIndex === -1) {
-        selectedFiles.push(fileName);
-      } else {
-        selectedFiles.splice(fileIndex, 1);
-      }
-      
-      // Update state
-      userManager.setUserState(chatId, {
-        ...state,
-        selectedFiles
-      });
-      
-      // Update selection message
-      await showFileSelectionMessage(chatId, state.availableFiles, selectedFiles);
-    }
-  } else if (query.data === 'merge_done') {
-    const state = userManager.getUserState(chatId);
-    
-    if (state && state.selectedFiles.length >= 2) {
-      await mergeSelectedFiles(chatId, state.selectedFiles, state.outputName);
-    } else {
-      bot.sendMessage(chatId, '❌ Pilih minimal 2 file untuk digabungkan');
-    }
-  } else if (query.data === 'merge_cancel') {
-    // Clear user state and send cancellation message
-    userManager.clearUserState(chatId);
-    await bot.editMessageText('❌ Penggabungan file dibatalkan', {
-      chat_id: chatId,
-      message_id: query.message.message_id
-    });
-  }
-  
-  // Answer callback query to remove loading state
-  bot.answerCallbackQuery(query.id);
-});
-
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const userState = userManager.getUserState(chatId);
+  // Biarkan handler konfirmasi merge memproses tombol Lanjutkan/Batal.
+  if (userState?.action === 'merge_confirm') return;
 
   if (!userState) {
     await bot.answerCallbackQuery(query.id);
     return;
   }
 
-  const userFolder = path.join(process.cwd(), 'userfiles', chatId.toString());
+  const userFolder = getUserFolder(chatId);
 
   try {
     if (query.data === 'merge_select_numbers') {
@@ -1964,7 +2164,7 @@ bot.on('callback_query', async (query) => {
 
       if (vcfFiles.length === 0) {
         await bot.sendMessage(chatId, '❌ Tidak ada file VCF yang tersedia. Silakan upload file terlebih dahulu.');
-        userManager.clearUserState(chatId);
+        finishUserProcess(chatId);
         return;
       }
 
@@ -2031,7 +2231,7 @@ bot.on('callback_query', async (query) => {
       }
     } else if (query.data === 'merge_cancel') {
       // Clear user state and send cancellation message
-      userManager.clearUserState(chatId);
+      finishUserProcess(chatId);
       await bot.editMessageText('❌ Penggabungan file dibatalkan', {
         chat_id: chatId,
         message_id: query.message.message_id
@@ -2048,6 +2248,8 @@ bot.on('callback_query', async (query) => {
 
 // Handle merge confirmation callbacks
 bot.on('callback_query', async (query) => {
+  if (!['merge_confirm', 'merge_cancel'].includes(query.data)) return;
+
   const chatId = query.message.chat.id;
   const userState = userManager.getUserState(chatId);
 
@@ -2058,15 +2260,13 @@ bot.on('callback_query', async (query) => {
   if (query.data === 'merge_confirm') {
     // Process the merge
     await mergeSelectedFiles(chatId, userState.selectedFiles, userState.outputName);
-    // Clear the state
-    userManager.clearUserState(chatId);
+    // State sudah dibersihkan oleh mergeSelectedFiles().
   } else if (query.data === 'merge_cancel') {
     await bot.editMessageText('❌ Penggabungan file dibatalkan', {
       chat_id: chatId,
       message_id: query.message.message_id
     });
-    // Clear the state
-    userManager.clearUserState(chatId);
+    finishUserProcess(chatId);
   }
 });
 
@@ -2105,6 +2305,8 @@ bot.onText(/\/createvcf(?:\s+(.+))?/, async (msg, match) => {
     );
     return;
   }
+
+  if (await rejectIfBusy(chatId, 'pembuatan VCF')) return;
 
   try {
     let rawContacts = [];
@@ -2167,6 +2369,14 @@ bot.onText(/\/createvcf(?:\s+(.+))?/, async (msg, match) => {
       return `${i + 1}. ${c.name}${isNumbered ? ' 🔄' : ''} (${c.number})`;
     }).join('\n');
 
+    if (!(await startUserProcess(chatId, 'pembuatan VCF', {
+      action: 'create_vcf',
+      data: {
+        contacts,
+        defaultFilename
+      }
+    }))) return;
+
     await bot.sendMessage(chatId,
       `📝 Kontak yang akan dibuat (${contacts.length}):\n\n${contactSummary}\n\n` +
       (contacts.some((c, i) => c.name !== rawContacts[i].name) ? 
@@ -2185,23 +2395,17 @@ bot.onText(/\/createvcf(?:\s+(.+))?/, async (msg, match) => {
       }
     );
 
-    // Update user state
-    userManager.setUserState(chatId, {
-      action: 'create_vcf',
-      data: {
-        contacts,
-        defaultFilename
-      }
-    });
-
   } catch (error) {
     console.error('Error creating VCF:', error);
     bot.sendMessage(chatId, '❌ ' + error.message);
+    finishUserProcess(chatId);
   }
 });
 
 // Handle VCF filename selection
 bot.on('callback_query', async (query) => {
+  if (!['vcf_default_multi', 'vcf_custom_multi'].includes(query.data)) return;
+
   const chatId = query.message.chat.id;
   const userState = userManager.getUserState(chatId);
 
@@ -2212,7 +2416,7 @@ bot.on('callback_query', async (query) => {
   if (query.data === 'vcf_default_multi') {
     // Use default filename
     await createAndSendMultiVcf(chatId, userState.data.contacts, userState.data.defaultFilename);
-    userManager.clearUserState(chatId);
+    finishUserProcess(chatId);
   } else if (query.data === 'vcf_custom_multi') {
     // Ask for custom filename
     await bot.sendMessage(chatId, 
@@ -2241,7 +2445,7 @@ bot.on('text', async (msg) => {
   }
 
   await createAndSendMultiVcf(chatId, userState.data.contacts, `${customName}.vcf`);
-  userManager.clearUserState(chatId);
+  finishUserProcess(chatId);
 });
 
 // Helper function to create and send VCF file with multiple contacts
@@ -2255,22 +2459,52 @@ async function createAndSendMultiVcf(chatId, contacts, filename) {
     ).join('\n');
 
     // Create user folder if not exists
-    const userFolder = path.join(process.cwd(), 'userfiles', chatId.toString());
+    const userFolder = getUserFolder(chatId);
     await fsPromises.mkdir(userFolder, { recursive: true });
 
-    // Save VCF file
+    // Save VCF file setelah cek storage
     const filePath = path.join(userFolder, filename);
+    const storage = await getUserStorageInfo(userFolder);
+    const limits = userManager.getStorageLimits(chatId);
+    const alreadyExists = await fileExists(filePath);
+    const oldSize = alreadyExists ? (await fsPromises.stat(filePath)).size : 0;
+    const outputSize = Buffer.byteLength(vcfContent, 'utf8');
+
+    if (!alreadyExists && storage.fileCount >= limits.MAX_FILES_PER_USER) {
+      throw new Error('Batas maksimal jumlah file tercapai. Hapus file lama dulu dengan /deletefile atau /clean.');
+    }
+
+    if (outputSize > limits.MAX_FILE_SIZE) {
+      throw new Error(`Ukuran file VCF terlalu besar. Maksimal ${formatBytes(limits.MAX_FILE_SIZE)}, hasil ${formatBytes(outputSize)}.`);
+    }
+
+    if (storage.totalSize - oldSize + outputSize > limits.MAX_TOTAL_SIZE) {
+      throw new Error('Total storage akan melewati batas. Hapus file lama dulu dengan /deletefile atau /clean.');
+    }
+
     await fsPromises.writeFile(filePath, vcfContent);
 
     // Generate contact summary
     const summary = contacts.map((c, i) => `${i + 1}. ${c.name} (${c.number})`).join('\n');
 
-    // Send file to user
-    await bot.sendDocument(chatId, fs.createReadStream(filePath), {
-      filename: filename,
-      caption: `✅ File VCF berhasil dibuat dengan ${contacts.length} kontak:\n\n${summary}\n\nFile: ${filename}`,
-      contentType: 'text/vcard'
-    });
+    // Send file to user dengan retry 3x
+    try {
+      await sendFile(
+        chatId,
+        filePath,
+        `✅ File VCF berhasil dibuat dengan ${contacts.length} kontak:
+
+${summary}
+
+File: ${filename}`
+      );
+    } catch (sendError) {
+      console.error('Error sending created VCF file:', sendError);
+      await bot.sendMessage(
+        chatId,
+        `⚠️ File ${filename} sudah dibuat dan tersimpan, tetapi gagal dikirim setelah ${SEND_FILE_MAX_RETRIES}x percobaan. Gunakan /getfile ${path.parse(filename).name} untuk mengambil ulang.`
+      );
+    }
   } catch (error) {
     console.error('Error creating VCF:', error);
     bot.sendMessage(chatId, '❌ Gagal membuat file: ' + error.message);
